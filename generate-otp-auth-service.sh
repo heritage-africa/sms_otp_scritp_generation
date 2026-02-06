@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# generate-otp-auth-service.sh
+# generate-otp-auth-service.sh (V2 — profils + OpenShift + Vault Kubernetes Auth “propre prod”)
 # Génère un microservice Spring Boot "OTP Auth" prod-ready (Redis OTP store, Vault Transit HMAC, SMSEAGLE BasicAuth, Email OTP),
-# avec tests unitaires, Dockerfile, manifests OpenShift/K8s, et une structure prête à évoluer en microservices.
+# avec tests unitaires, Dockerfile, manifests OpenShift/K8s, et profils dev/test/docker/kubernetes/qualif/preprod/prod.
 #
 # Usage:
 #   ./generate-otp-auth-service.sh --name otp-auth-service --groupId heritage.africa --artifactId otp-auth-service --package heritage.africa.otp \
-#     --java 21 --boot 3.3.5 --cloud 2023.0.4 --out ./go-gainde-otp
+#     --java 21 --boot 3.3.5 --cloud 2023.0.4 --out ./go-gainde-otp --ns heritage-africa-otp --image otp-auth-service:latest
 #
 set -euo pipefail
 
@@ -14,7 +14,6 @@ set -euo pipefail
 # -----------------------------
 log() { echo -e "[$(date +%H:%M:%S)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
-
 need() { command -v "$1" >/dev/null 2>&1 || die "Commande requise introuvable: $1"; }
 
 # -----------------------------
@@ -31,7 +30,7 @@ OUT_DIR="."
 PORT="8080"
 
 # OpenShift/K8s defaults
-K8S_NS="otp"
+K8S_NS="heritage-africa-otp"
 IMAGE="otp-auth-service:latest"
 ROUTE_HOST=""   # si vide, OpenShift générera
 
@@ -53,7 +52,7 @@ while [[ $# -gt 0 ]]; do
     --image) IMAGE="$2"; shift 2;;
     --route-host) ROUTE_HOST="$2"; shift 2;;
     -h|--help)
-      sed -n '1,80p' "$0"; exit 0;;
+      sed -n '1,120p' "$0"; exit 0;;
     *) die "Argument inconnu: $1";;
   esac
 done
@@ -62,6 +61,7 @@ need mkdir
 need cat
 need sed
 need tr
+need chmod
 
 BASE="${OUT_DIR%/}/${ARTIFACT_ID}"
 SRC_MAIN="$BASE/src/main/java/$(echo "$PKG" | tr '.' '/')"
@@ -74,7 +74,9 @@ if [[ -e "$BASE" ]]; then
 fi
 
 log "Création du projet: $BASE"
-mkdir -p "$SRC_MAIN" "$SRC_MAIN"/dto "$SRC_MAIN"/client "$SRC_MAIN"/config "$SRC_TEST" "$RES_MAIN" "$RES_TEST"
+mkdir -p "$SRC_MAIN" "$SRC_MAIN"/dto "$SRC_MAIN"/client "$SRC_MAIN"/config "$SRC_MAIN"/notify "$SRC_MAIN"/vault "$SRC_MAIN"/otp
+mkdir -p "$SRC_TEST" "$SRC_TEST"/vault "$SRC_TEST"/notify "$SRC_TEST"/otp
+mkdir -p "$RES_MAIN" "$RES_TEST"
 mkdir -p "$BASE/manifests/openshift" "$BASE/docker" "$BASE/scripts"
 
 # -----------------------------
@@ -140,7 +142,7 @@ cat > "$BASE/pom.xml" <<EOF
       <artifactId>spring-boot-starter-mail</artifactId>
     </dependency>
 
-    <!-- Vault Config (for env + token) -->
+    <!-- Vault Config (TOKEN en docker, KUBERNETES en prod OpenShift) -->
     <dependency>
       <groupId>org.springframework.cloud</groupId>
       <artifactId>spring-cloud-starter-vault-config</artifactId>
@@ -173,12 +175,13 @@ cat > "$BASE/pom.xml" <<EOF
           </execution>
         </executions>
       </plugin>
+
       <plugin>
         <artifactId>maven-compiler-plugin</artifactId>
-          <configuration>
-            <compilerArgs>
-              <arg>-parameters</arg>
-            </compilerArgs>
+        <configuration>
+          <compilerArgs>
+            <arg>-parameters</arg>
+          </compilerArgs>
         </configuration>
       </plugin>
 
@@ -195,7 +198,7 @@ cat > "$BASE/pom.xml" <<EOF
 EOF
 
 # -----------------------------
-# application.yml
+# application.yml (base neutre) + profils
 # -----------------------------
 cat > "$RES_MAIN/application.yml" <<EOF
 server:
@@ -218,16 +221,15 @@ spring:
     properties:
       mail.smtp.auth: true
       mail.smtp.starttls.enable: true
-
+# Vault OFF par défaut (activé via profils / VAULT_ENABLED)      
   cloud:
     vault:
-      uri: \${VAULT_URI:http://vault:8200}
-      authentication: TOKEN
-      token: \${VAULT_TOKEN:}
-      kv:
-        enabled: true
-        backend: secret
-        default-context: ${NAME}
+      enabled: \${VAULT_ENABLED:false}
+
+# OTP store: memory|redis (réutilise tes @ConditionalOnProperty(name="otp.store"...))
+otp:
+  store: \${OTP_STORE:memory}
+
 
 management:
   endpoints:
@@ -238,6 +240,9 @@ management:
     health:
       probes:
         enabled: true
+  health:
+    vault:
+      enabled: \${VAULT_ENABLED:false}
 
 app:
   otp:
@@ -256,9 +261,80 @@ app:
     base-url: \${SMSEAGLE_BASE_URL:https://smseagle.local}
     username: \${SMSEAGLE_USER:}
     password: \${SMSEAGLE_PASS:}
-    # Endpoint à ajuster selon ton firmware/API; un seul endroit à modifier
     sms-path: \${SMSEAGLE_SMS_PATH:/api/v2/messages/sms}
+EOF
 
+# Profils
+cat > "$RES_MAIN/application-dev.yml" <<EOF
+otp:
+  store: memory
+spring:
+  cloud:
+    vault:
+      enabled: false
+logging:
+  level:
+    root: INFO
+    ${PKG}: DEBUG
+EOF
+
+cat > "$RES_MAIN/application-test.yml" <<EOF
+otp:
+  store: memory
+spring:
+  cloud:
+    vault:
+      enabled: false
+EOF
+
+cat > "$RES_MAIN/application-docker.yml" <<EOF
+otp:
+  store: redis
+spring:
+  cloud:
+    vault:
+      enabled: \${VAULT_ENABLED:false}
+      uri: \${VAULT_URI:http://vault:8200}
+      authentication: TOKEN
+      token: \${VAULT_TOKEN:}
+EOF
+
+cat > "$RES_MAIN/application-kubernetes.yml" <<EOF
+otp:
+  store: redis
+spring:
+  cloud:
+    vault:
+      enabled: true
+      # Si Vault est dans le namespace "vault":
+      uri: \${VAULT_URI:http://vault.vault.svc:8200}
+      # Si Vault est dans le même namespace que l'app, override VAULT_URI à "http://vault:8200"
+      authentication: KUBERNETES
+      kubernetes:
+        role: \${VAULT_K8S_ROLE:${NAME}}
+        kubernetes-path: \${VAULT_K8S_MOUNT:kubernetes}
+      kv:
+        enabled: true
+        backend: secret
+        default-context: ${NAME}
+EOF
+
+cat > "$RES_MAIN/application-qualif.yml" <<EOF
+spring:
+  profiles:
+    include: kubernetes
+EOF
+
+cat > "$RES_MAIN/application-preprod.yml" <<EOF
+spring:
+  profiles:
+    include: kubernetes
+EOF
+
+cat > "$RES_MAIN/application-prod.yml" <<EOF
+spring:
+  profiles:
+    include: kubernetes
 EOF
 
 # -----------------------------
@@ -286,18 +362,26 @@ ENTRYPOINT ["sh","-c","java $JAVA_OPTS -jar /app/app.jar"]
 EOF
 
 # -----------------------------
-# K8s / OpenShift manifests (Deployment, Service, Route, Config/Secret placeholders)
+# OpenShift manifests (kustomize)
 # -----------------------------
 cat > "$BASE/manifests/openshift/kustomization.yaml" <<EOF
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: ${K8S_NS}
 resources:
+  - serviceaccount.yaml
   - deployment.yaml
   - service.yaml
   - route.yaml
   - configmap.yaml
   - secret.yaml
+EOF
+
+cat > "$BASE/manifests/openshift/serviceaccount.yaml" <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${NAME}-sa
 EOF
 
 cat > "$BASE/manifests/openshift/configmap.yaml" <<EOF
@@ -312,13 +396,13 @@ data:
   OTP_TTL_SECONDS: "300"
   OTP_MAX_ATTEMPTS: "5"
   OTP_LOCK_SECONDS: "1800"
-  VAULT_URI: "http://vault:8200"
   VAULT_TRANSIT_KEY: "otp-hmac"
   SMSEAGLE_BASE_URL: "https://smseagle.local"
   SMSEAGLE_SMS_PATH: "/api/v2/messages/sms"
-  # SMTP_HOST, SMTP_PORT peuvent aussi être mis ici si non sensibles
+  # SMTP_HOST, SMTP_PORT peuvent être mis ici si non sensibles
 EOF
 
+# Secret OpenShift (SANS VAULT_TOKEN en prod “propre”)
 cat > "$BASE/manifests/openshift/secret.yaml" <<EOF
 apiVersion: v1
 kind: Secret
@@ -326,7 +410,6 @@ metadata:
   name: ${NAME}-secret
 type: Opaque
 stringData:
-  VAULT_TOKEN: "CHANGE_ME"
   SMSEAGLE_USER: "CHANGE_ME"
   SMSEAGLE_PASS: "CHANGE_ME"
   SMTP_USER: "CHANGE_ME"
@@ -348,12 +431,30 @@ spec:
       labels:
         app: ${NAME}
     spec:
+      serviceAccountName: ${NAME}-sa
       containers:
         - name: ${NAME}
           image: ${IMAGE}
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
+          env:
+            # Profil prod (inclut kubernetes -> Vault K8S auth)
+            - name: SPRING_PROFILES_ACTIVE
+              value: "prod"
+            - name: VAULT_ENABLED
+              value: "true"
+            - name: OTP_STORE
+              value: "redis"
+
+            # Vault (Kubernetes auth)
+            - name: VAULT_URI
+              value: "http://vault.vault.svc:8200"
+            - name: VAULT_K8S_ROLE
+              value: "${NAME}"
+            - name: VAULT_K8S_MOUNT
+              value: "kubernetes"
+
           envFrom:
             - configMapRef:
                 name: ${NAME}-config
@@ -394,7 +495,6 @@ spec:
       targetPort: 8080
 EOF
 
-# Route (OpenShift)
 cat > "$BASE/manifests/openshift/route.yaml" <<EOF
 apiVersion: route.openshift.io/v1
 kind: Route
@@ -410,15 +510,13 @@ spec:
     termination: edge
 EOF
 if [[ -n "$ROUTE_HOST" ]]; then
-  # inject host
   sed -i "s/spec:/spec:\n  host: ${ROUTE_HOST}/" "$BASE/manifests/openshift/route.yaml"
 fi
 
 # -----------------------------
 # Java sources
 # -----------------------------
-APP_CLASS="${SRC_MAIN}/OtpAuthServiceApplication.java"
-cat > "$APP_CLASS" <<EOF
+cat > "${SRC_MAIN}/OtpAuthServiceApplication.java" <<EOF
 package ${PKG};
 
 import org.springframework.boot.SpringApplication;
@@ -465,7 +563,6 @@ public record AppProps(
 }
 EOF
 
-# DTOs + enums
 cat > "${SRC_MAIN}/Channel.java" <<EOF
 package ${PKG};
 
@@ -520,9 +617,6 @@ package ${PKG}.dto;
 public record VerifyOtpResponse(boolean verified, String next) {}
 EOF
 
-mkdir -p "${SRC_MAIN}/dto"
-
-# Controller
 cat > "${SRC_MAIN}/AuthController.java" <<EOF
 package ${PKG};
 
@@ -557,8 +651,7 @@ public class AuthController {
 }
 EOF
 
-# Senders
-mkdir -p "${SRC_MAIN}/notify"
+# Notify interfaces + impl
 cat > "${SRC_MAIN}/notify/SmsSender.java" <<EOF
 package ${PKG}.notify;
 
@@ -615,7 +708,8 @@ import java.util.Map;
 @Service
 public class SmseagleSmsSender implements SmsSender {
 
-  private final RestClient client;
+  // pas final -> testable via ReflectionTestUtils
+  private RestClient client;
   private final AppProps props;
 
   public SmseagleSmsSender(AppProps props) {
@@ -631,8 +725,6 @@ public class SmseagleSmsSender implements SmsSender {
 
   @Override
   public void send(String phoneE164, String message) {
-    // Ajuste le payload si ton SMSEAGLE attend d'autres champs.
-    // L'important: BasicAuth + POST JSON, un seul endroit (smsPath) à adapter.
     client.post()
         .uri(props.smseagleSmsPath())
         .body(Map.of("to", phoneE164, "text", message))
@@ -642,38 +734,41 @@ public class SmseagleSmsSender implements SmsSender {
 }
 EOF
 
-# Vault Transit HMAC service
-mkdir -p "${SRC_MAIN}/vault"
-cat > "${SRC_MAIN}/vault/VaultTransitMacService.java" <<EOF
+# MacService interface + impls (Vault / Local)
+cat > "${SRC_MAIN}/vault/MacService.java" <<EOF
+package ${PKG}.vault;
+
+public interface MacService {
+  String hmac(String challengeId, String destination, String code);
+}
+EOF
+
+cat > "${SRC_MAIN}/vault/VaultMacService.java" <<EOF
 package ${PKG}.vault;
 
 import ${PKG}.AppProps;
-import org.springframework.http.MediaType;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestClient;
+import org.springframework.vault.core.VaultTemplate;
+import org.springframework.vault.support.VaultResponse;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Map;
 
 @Service
-public class VaultTransitMacService {
+@ConditionalOnProperty(name = "spring.cloud.vault.enabled", havingValue = "true")
+public class VaultMacService implements MacService {
 
-  private final RestClient vaultClient;
+  private final VaultTemplate vault;
   private final AppProps props;
 
-  public VaultTransitMacService(AppProps props) {
+  public VaultMacService(VaultTemplate vault, AppProps props) {
+    this.vault = vault;
     this.props = props;
-    this.vaultClient = RestClient.builder()
-        .baseUrl(System.getenv().getOrDefault("VAULT_URI", "http://vault:8200"))
-        .defaultHeaders(h -> {
-          String token = System.getenv().getOrDefault("VAULT_TOKEN", "");
-          h.set("X-Vault-Token", token);
-          h.setContentType(MediaType.APPLICATION_JSON);
-        })
-        .build();
   }
 
+  @Override
   public String hmac(String challengeId, String destination, String code) {
     String msg = challengeId + ":" + destination + ":" + code;
     String inputB64 = Base64.getEncoder().encodeToString(msg.getBytes(StandardCharsets.UTF_8));
@@ -683,20 +778,37 @@ public class VaultTransitMacService {
         "algorithm", "sha2-256"
     );
 
-    Map resp = vaultClient.post()
-        .uri("/v1/transit/hmac/{key}", props.vaultTransitKey())
-        .body(req)
-        .retrieve()
-        .body(Map.class);
+    VaultResponse resp = vault.write("transit/hmac/" + props.vaultTransitKey(), req);
+    if (resp == null || resp.getData() == null) {
+      throw new IllegalStateException("Vault transit response empty");
+    }
 
-    Map data = (Map) resp.get("data");
-    return (String) data.get("hmac"); // ex: vault:v1:...
+    Object h = resp.getData().get("hmac");
+    if (h == null) throw new IllegalStateException("Vault transit response missing hmac");
+    return h.toString();
   }
 }
 EOF
 
-# OTP store abstraction + Redis impl (plus InMemory for tests)
-mkdir -p "${SRC_MAIN}/otp"
+cat > "${SRC_MAIN}/vault/LocalMacService.java" <<EOF
+package ${PKG}.vault;
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Service;
+
+@Service
+@ConditionalOnProperty(name = "spring.cloud.vault.enabled", havingValue = "false", matchIfMissing = true)
+public class LocalMacService implements MacService {
+
+  @Override
+  public String hmac(String challengeId, String destination, String code) {
+    return "LOCAL(" + challengeId + ":" + destination + ":" + code + ")";
+  }
+}
+EOF
+
+
+# OTP store abstraction + Redis impl + InMemory
 cat > "${SRC_MAIN}/otp/OtpStore.java" <<EOF
 package ${PKG}.otp;
 
@@ -722,6 +834,7 @@ import ${PKG}.Channel;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+
 import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
@@ -797,6 +910,7 @@ package ${PKG}.otp;
 import ${PKG}.Channel;
 import org.springframework.stereotype.Component;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+
 import java.time.Instant;
 import java.util.Map;
 import java.util.Optional;
@@ -920,7 +1034,6 @@ public class OtpService {
 
     store.incrementAttempts(challengeId);
 
-    // re-check after increment
     var r2 = store.get(challengeId).orElse(r);
     if (r2.attempts() >= props.maxAttempts()) {
       store.lock(challengeId, now + props.lockSeconds(), Math.max(props.lockSeconds(), props.otpTtlSeconds()));
@@ -1021,29 +1134,21 @@ public class OtpOrchestratorService {
 EOF
 
 # -----------------------------
-# Tests unitaires (Vault Transit + SMSEAGLE BasicAuth + OTP verify)
-# - On teste VaultTransitMacService via MockRestServiceServer
-# - On teste SmseagleSmsSender via MockRestServiceServer (BasicAuth header)
-# - On teste OtpService via InMemoryOtpStore (vrai flux, sans Redis)
+# Tests unitaires (adaptés VaultTemplate)
 # -----------------------------
-mkdir -p "${SRC_TEST}/vault" "${SRC_TEST}/notify" "${SRC_TEST}/otp"
-
 cat > "${SRC_TEST}/vault/VaultTransitMacServiceTest.java" <<EOF
 package ${PKG}.vault;
 
-import ${PKG}.AppProps;
+import heritage.africa.otp.AppProps;
 import org.junit.jupiter.api.Test;
-import org.springframework.http.MediaType;
-import org.springframework.test.util.ReflectionTestUtils;
-import org.springframework.web.client.RestClient;
-import org.springframework.web.client.RestTemplate;
-import org.springframework.test.web.client.MockRestServiceServer;
+import org.springframework.vault.core.VaultTemplate;
+import org.springframework.vault.support.VaultResponse;
+
 
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.springframework.test.web.client.match.MockRestRequestMatchers.*;
-import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
+import static org.mockito.Mockito.*;
 
 public class VaultTransitMacServiceTest {
 
@@ -1056,34 +1161,18 @@ public class VaultTransitMacServiceTest {
         new AppProps.Smseagle("https://smseagle.local","u","p","/api/v2/messages/sms")
     );
 
-    // Construire un RestClient basé sur RestTemplate pour MockRestServiceServer
-    RestTemplate rt = new RestTemplate();
-    MockRestServiceServer server = MockRestServiceServer.bindTo(rt).build();
+    VaultResponse vr = new VaultResponse();
+    vr.setData(Map.of("hmac", "vault:v1:abc"));
+    
+    VaultTemplate vault = mock(VaultTemplate.class);
+    when(vault.write(eq("transit/hmac/otp-hmac"), any(Map.class))).thenReturn(vr);
 
-    // On remplace le vaultClient interne via reflection (test-friendly)
-    VaultTransitMacService svc = new VaultTransitMacService(props);
-    RestClient testClient = RestClient.builder()
-        .requestFactory(new org.springframework.http.client.ClientHttpRequestFactory() {
-          @Override public org.springframework.http.client.ClientHttpRequest createRequest(java.net.URI uri, org.springframework.http.HttpMethod httpMethod) throws java.io.IOException {
-            return rt.getRequestFactory().createRequest(uri, httpMethod);
-          }
-        })
-        .baseUrl("http://vault:8200")
-        .defaultHeaders(h -> {
-          h.set("X-Vault-Token", "t");
-          h.setContentType(MediaType.APPLICATION_JSON);
-        })
-        .build();
-    ReflectionTestUtils.setField(svc, "vaultClient", testClient);
-
-    server.expect(requestTo("http://vault:8200/v1/transit/hmac/otp-hmac"))
-        .andExpect(method(org.springframework.http.HttpMethod.POST))
-        .andExpect(header("X-Vault-Token", "t"))
-        .andRespond(withSuccess("{\\"data\\":{\\"hmac\\":\\"vault:v1:abc\\"}}", MediaType.APPLICATION_JSON));
+    VaultTransitMacService svc = new VaultTransitMacService(vault, props);
 
     String h = svc.hmac("cid","+221771234567","123456");
     assertThat(h).isEqualTo("vault:v1:abc");
-    server.verify();
+
+    verify(vault, times(1)).write(eq("transit/hmac/otp-hmac"), any(Map.class));
   }
 }
 EOF
@@ -1117,7 +1206,6 @@ public class SmseagleSmsSenderTest {
 
     SmseagleSmsSender sender = new SmseagleSmsSender(props);
 
-    // Injecter un RestClient basé RestTemplate mockable
     RestTemplate rt = new RestTemplate();
     MockRestServiceServer server = MockRestServiceServer.bindTo(rt).build();
 
@@ -1151,12 +1239,13 @@ EOF
 
 cat > "${SRC_TEST}/OtpServiceTest.java" <<EOF
 package ${PKG};
-
-import ${PKG}.otp.InMemoryOtpStore;
-import ${PKG}.vault.VaultTransitMacService;
+import heritage.africa.otp.otp.InMemoryOtpStore;
+import heritage.africa.otp.vault.VaultTransitMacService;
 import org.junit.jupiter.api.Test;
+import org.springframework.vault.core.VaultTemplate;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.*;
 
 public class OtpServiceTest {
 
@@ -1169,17 +1258,18 @@ public class OtpServiceTest {
         new AppProps.Smseagle("http://x","u","p","/api/v2/messages/sms")
     );
 
-    // Fake Vault MAC (déterministe) pour test unitaire pur
-    VaultTransitMacService mac = new VaultTransitMacService(props) {
-      @Override public String hmac(String challengeId, String destination, String code) {
-        return "MAC(" + challengeId + "," + destination + "," + code + ")";
-      }
-    };
+    // Fake MAC déterministe (mock VaultTransitMacService au lieu d'appeler Vault)
+    VaultTransitMacService mac = mock(VaultTransitMacService.class);
+    when(mac.hmac(anyString(), anyString(), anyString())).thenAnswer(inv ->
+        "MAC(" + inv.getArgument(0) + "," + inv.getArgument(1) + "," + inv.getArgument(2) + ")"
+    );
 
     var store = new InMemoryOtpStore();
     var svc = new OtpService(store, mac, props);
 
     var ch = svc.create(new Destination(Channel.SMS, "+221771234567"));
+    // on “recalcule” le même MAC attendu
+    when(mac.hmac(eq(ch.challengeId()), eq("+221771234567"), eq(ch.code()))).thenReturn("MAC(" + ch.challengeId() + ",+221771234567," + ch.code() + ")");
 
     assertThat(svc.verify(ch.challengeId(), ch.code())).isTrue();
     assertThat(svc.verify(ch.challengeId(), ch.code())).isFalse(); // one-time
@@ -1193,22 +1283,22 @@ public class OtpServiceTest {
         new AppProps.Vault("otp-hmac"),
         new AppProps.Smseagle("http://x","u","p","/api/v2/messages/sms")
     );
-
-    VaultTransitMacService mac = new VaultTransitMacService(props) {
-      @Override public String hmac(String challengeId, String destination, String code) {
-        return "MAC(" + challengeId + "," + destination + "," + code + ")";
-      }
-    };
-
+  
+    VaultTransitMacService mac = mock(VaultTransitMacService.class);
+    when(mac.hmac(anyString(), anyString(), anyString())).thenAnswer(inv ->
+        "MAC(" + inv.getArgument(0) + "," + inv.getArgument(1) + "," + inv.getArgument(2) + ")"
+    );
+  
     var store = new InMemoryOtpStore();
     var svc = new OtpService(store, mac, props);
-
+  
     var ch = svc.create(new Destination(Channel.EMAIL, "user@example.com"));
-
+  
     assertThat(svc.verify(ch.challengeId(), "000000")).isFalse();
     assertThat(svc.verify(ch.challengeId(), "111111")).isFalse(); // atteint max attempts -> lock
     assertThat(svc.verify(ch.challengeId(), ch.code())).isFalse(); // locked
   }
+
 }
 EOF
 
@@ -1219,11 +1309,18 @@ cat > "$BASE/README.md" <<EOF
 # ${NAME}
 
 Microservice OTP d'inscription:
-- Locaux (préfixe ${K8S_NS} / indicatif \`+221\`) : OTP par SMS via **SMSEAGLE** (Basic Auth user/pass)
+- Locaux (indicatif \`+221\`) : OTP par SMS via **SMSEAGLE** (Basic Auth user/pass)
 - Étrangers : OTP par **Email** (SMTP)
-- Stockage OTP : **Redis** (TTL)
-- HMAC OTP : **Vault Transit** (\`transit/hmac/{key}\`) (le secret ne sort pas de Vault)
-- Prêt OpenShift: Dockerfile non-root + manifests (Deployment/Service/Route)
+- Stockage OTP : **Redis** (TTL) ou **InMemory** (dev/test)
+- HMAC OTP : **Vault Transit** (\`transit/hmac/{key}\`) — secret HMAC ne sort pas de Vault
+- Prod OpenShift “propre” : **Vault Kubernetes Auth** (pas de token statique)
+
+## Profils
+- dev : Vault OFF, store memory
+- test : Vault OFF, store memory
+- docker : store redis, Vault TOKEN optionnel via VAULT_ENABLED/VAULT_TOKEN
+- kubernetes : Vault ON (KUBERNETES auth), store redis
+- qualif/preprod/prod : incluent kubernetes
 
 ## API
 - POST \`/auth/register/start\`
@@ -1236,11 +1333,19 @@ mvn test
 mvn package
 \`\`\`
 
-## Docker
+## Local (dev)
+\`\`\`bash
+SPRING_PROFILES_ACTIVE=dev mvn spring-boot:run
+\`\`\`
+
+## Docker (profil docker)
 \`\`\`bash
 docker build -f docker/Dockerfile -t ${IMAGE} .
-docker run --rm -p 8080:8080 -e VAULT_TOKEN="s.xxxxx" -e VAULT_URI="http://vault:8200" ${IMAGE}
-
+docker run --rm -p 8080:8080 \\
+  -e SPRING_PROFILES_ACTIVE=docker \\
+  -e OTP_STORE=redis \\
+  -e REDIS_HOST=redis \\
+  ${IMAGE}
 \`\`\`
 
 ## OpenShift (kustomize)
@@ -1249,14 +1354,16 @@ oc new-project ${K8S_NS} || true
 oc apply -k manifests/openshift
 \`\`\`
 
-> Ajuster \`app.smseagle.sms-path\` selon ton firmware/API SMSEAGLE.
+### Vault côté OpenShift (rappel)
+Le rôle Vault Kubernetes doit binder:
+- ServiceAccount: \`${NAME}-sa\`
+- Namespace: \`${K8S_NS}\`
 EOF
 
 cat > "$BASE/scripts/dev-redis-vault.sh" <<'EOF'
 #!/usr/bin/env bash
 set -e
-# Petit helper local (dev) : redis + vault (token simple)
-# Nécessite docker/podman.
+# Helper local : redis + vault (dev token) pour tests manuels
 docker network create otp-net >/dev/null 2>&1 || true
 
 docker run -d --name otp-redis --network otp-net -p 6379:6379 redis:7-alpine >/dev/null 2>&1 || true
@@ -1290,5 +1397,5 @@ log "Prochaines commandes:"
 echo "  cd \"$BASE\""
 echo "  mvn test"
 echo "  docker build -f docker/Dockerfile -t ${IMAGE} ."
+echo "  oc new-project ${K8S_NS} || true"
 echo "  oc apply -k manifests/openshift"
-
