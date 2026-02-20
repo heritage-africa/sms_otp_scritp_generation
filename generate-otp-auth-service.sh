@@ -1,42 +1,35 @@
 #!/usr/bin/env bash
-# generate-otp-auth-service.sh (V2 — profils + OpenShift + Vault Kubernetes Auth “propre prod”)
-# Génère un microservice Spring Boot "OTP Auth" prod-ready (Redis OTP store, Vault Transit HMAC, SMSEAGLE BasicAuth, Email OTP),
-# avec tests unitaires, Dockerfile, manifests OpenShift/K8s, et profils dev/test/docker/kubernetes/qualif/preprod/prod.
-#
-# Usage:
-#   ./generate-otp-auth-service.sh --name otp-auth-service --groupId heritage.africa --artifactId otp-auth-service --package heritage.africa.otp \
-#     --java 21 --boot 3.3.5 --cloud 2023.0.4 --out ./go-gainde-otp --ns heritage-africa-otp --image otp-auth-service:latest
-#
+# generate-otp-auth-service.sh
+# Version complète avec docker-compose, scripts et tests corrigés
+
 set -euo pipefail
 
-# -----------------------------
-# Helpers
-# -----------------------------
-log() { echo -e "[$(date +%H:%M:%S)] $*"; }
-die() { echo "ERROR: $*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || die "Commande requise introuvable: $1"; }
-
-# -----------------------------
-# Defaults
-# -----------------------------
+# Configuration par défaut
 NAME="otp-auth-service"
 GROUP_ID="heritage.africa"
 ARTIFACT_ID="otp-auth-service"
 PKG="heritage.africa.otp"
 JAVA_VER="21"
-BOOT_VER="3.3.5"
-CLOUD_VER="2023.0.4"
+BOOT_VER="3.2.5"
+CLOUD_VER="2023.0.1"
 OUT_DIR="."
 PORT="8080"
-
-# OpenShift/K8s defaults
-K8S_NS="heritage-africa-otp"
+K8S_NS="otp-system"
 IMAGE="otp-auth-service:latest"
-ROUTE_HOST=""   # si vide, OpenShift générera
 
-# -----------------------------
-# Args
-# -----------------------------
+# Couleurs pour les logs
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Traitement des arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name) NAME="$2"; shift 2;;
@@ -50,18 +43,12 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="$2"; shift 2;;
     --ns) K8S_NS="$2"; shift 2;;
     --image) IMAGE="$2"; shift 2;;
-    --route-host) ROUTE_HOST="$2"; shift 2;;
     -h|--help)
-      sed -n '1,120p' "$0"; exit 0;;
-    *) die "Argument inconnu: $1";;
+      echo "Usage: $0 [options]"
+      exit 0;;
+    *) log_error "Argument inconnu: $1"; exit 1;;
   esac
 done
-
-need mkdir
-need cat
-need sed
-need tr
-need chmod
 
 BASE="${OUT_DIR%/}/${ARTIFACT_ID}"
 SRC_MAIN="$BASE/src/main/java/$(echo "$PKG" | tr '.' '/')"
@@ -69,454 +56,224 @@ SRC_TEST="$BASE/src/test/java/$(echo "$PKG" | tr '.' '/')"
 RES_MAIN="$BASE/src/main/resources"
 RES_TEST="$BASE/src/test/resources"
 
-if [[ -e "$BASE" ]]; then
-  die "Le dossier existe déjà: $BASE (supprime-le ou change --artifactId/--out)"
-fi
-
-log "Création du projet: $BASE"
-mkdir -p "$SRC_MAIN" "$SRC_MAIN"/dto "$SRC_MAIN"/client "$SRC_MAIN"/config "$SRC_MAIN"/notify "$SRC_MAIN"/vault "$SRC_MAIN"/otp
-mkdir -p "$SRC_TEST" "$SRC_TEST"/vault "$SRC_TEST"/notify "$SRC_TEST"/otp
+# Création de la structure
+log_info "Création de la structure du projet..."
+mkdir -p "$SRC_MAIN"/{dto,client,config,notify,vault,otp}
+mkdir -p "$SRC_TEST"/{vault,notify,otp}
 mkdir -p "$RES_MAIN" "$RES_TEST"
-mkdir -p "$BASE/manifests/openshift" "$BASE/docker" "$BASE/scripts"
+mkdir -p "$BASE"/{docker,docker/vault,scripts,k8s/base,k8s/overlays/{dev,prod}}
 
-# -----------------------------
-# pom.xml (Spring Boot + Vault + Redis + Mail + Tests)
-# -----------------------------
-cat > "$BASE/pom.xml" <<EOF
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-  <modelVersion>4.0.0</modelVersion>
+# ============================================
+# 1. Fichiers Maven (pom.xml)
+# ============================================
+log_info "Génération du pom.xml..."
+cat > "$BASE/pom.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
 
-  <groupId>${GROUP_ID}</groupId>
-  <artifactId>${ARTIFACT_ID}</artifactId>
-  <version>0.1.0</version>
-  <name>${NAME}</name>
-  <description>OTP registration service (SMS local via SMSEAGLE, Email for foreign) with Vault Transit HMAC + Redis OTP store</description>
+    <groupId>GROUP_ID_PLACEHOLDER</groupId>
+    <artifactId>ARTIFACT_ID_PLACEHOLDER</artifactId>
+    <version>1.0.0</version>
+    <name>NAME_PLACEHOLDER</name>
+    <description>OTP Authentication Service with Vault Integration</description>
 
-  <properties>
-    <java.version>${JAVA_VER}</java.version>
-    <maven.compiler.release>${JAVA_VER}</maven.compiler.release>
-    <spring-boot.version>${BOOT_VER}</spring-boot.version>
-    <spring-cloud.version>${CLOUD_VER}</spring-cloud.version>
-  </properties>
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>BOOT_VER_PLACEHOLDER</version>
+        <relativePath/>
+    </parent>
 
-  <dependencyManagement>
+    <properties>
+        <java.version>JAVA_VER_PLACEHOLDER</java.version>
+        <maven.compiler.source>${java.version}</maven.compiler.source>
+        <maven.compiler.target>${java.version}</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <testcontainers.version>1.19.3</testcontainers.version>
+    </properties>
+
     <dependencies>
-      <dependency>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-dependencies</artifactId>
-        <version>\${spring-boot.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-      <dependency>
-        <groupId>org.springframework.cloud</groupId>
-        <artifactId>spring-cloud-dependencies</artifactId>
-        <version>\${spring-cloud.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
+        <!-- Spring Boot Starters -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Test Dependencies -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
-  </dependencyManagement>
 
-  <dependencies>
-    <!-- Web + Validation -->
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-web</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-validation</artifactId>
-    </dependency>
-
-    <!-- Redis -->
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-data-redis</artifactId>
-    </dependency>
-
-    <!-- Email -->
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-mail</artifactId>
-    </dependency>
-
-    <!-- Vault Config (TOKEN en docker, KUBERNETES en prod OpenShift) -->
-    <dependency>
-      <groupId>org.springframework.cloud</groupId>
-      <artifactId>spring-cloud-starter-vault-config</artifactId>
-    </dependency>
-
-    <!-- Actuator (health/readiness) -->
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-actuator</artifactId>
-    </dependency>
-
-    <!-- Tests -->
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-test</artifactId>
-      <scope>test</scope>
-    </dependency>
-  </dependencies>
-
-  <build>
-    <plugins>
-      <plugin>
-        <groupId>org.springframework.boot</groupId>
-        <artifactId>spring-boot-maven-plugin</artifactId>
-        <executions>
-          <execution>
-            <goals>
-              <goal>repackage</goal>
-            </goals>
-          </execution>
-        </executions>
-      </plugin>
-
-      <plugin>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <configuration>
-          <compilerArgs>
-            <arg>-parameters</arg>
-          </compilerArgs>
-        </configuration>
-      </plugin>
-
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <configuration>
-          <useModulePath>false</useModulePath>
-        </configuration>
-      </plugin>
-    </plugins>
-  </build>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <parameters>true</parameters>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>
 EOF
 
-# -----------------------------
-# application.yml (base neutre) + profils
-# -----------------------------
-cat > "$RES_MAIN/application.yml" <<EOF
-server:
-  port: ${PORT}
+# Remplacer les placeholders dans pom.xml
+sed -i "s/GROUP_ID_PLACEHOLDER/${GROUP_ID}/g" "$BASE/pom.xml"
+sed -i "s/ARTIFACT_ID_PLACEHOLDER/${ARTIFACT_ID}/g" "$BASE/pom.xml"
+sed -i "s/NAME_PLACEHOLDER/${NAME}/g" "$BASE/pom.xml"
+sed -i "s/JAVA_VER_PLACEHOLDER/${JAVA_VER}/g" "$BASE/pom.xml"
+sed -i "s/BOOT_VER_PLACEHOLDER/${BOOT_VER}/g" "$BASE/pom.xml"
 
+# ============================================
+# 2. Configuration Spring Boot
+# ============================================
+log_info "Génération des fichiers de configuration..."
+
+# Application principale
+cat > "$RES_MAIN/application.yml" <<EOF
 spring:
   application:
     name: ${NAME}
+  profiles:
+    active: \${SPRING_PROFILES_ACTIVE:dev}
 
-  data:
-    redis:
-      host: \${REDIS_HOST:redis}
-      port: \${REDIS_PORT:6379}
-
-  mail:
-    host: \${SMTP_HOST:}
-    port: \${SMTP_PORT:587}
-    username: \${SMTP_USER:}
-    password: \${SMTP_PASS:}
-    properties:
-      mail.smtp.auth: true
-      mail.smtp.starttls.enable: true
-# Vault OFF par défaut (activé via profils / VAULT_ENABLED)      
-  cloud:
-    vault:
-      enabled: \${VAULT_ENABLED:false}
-
-# OTP store: memory|redis (réutilise tes @ConditionalOnProperty(name="otp.store"...))
-otp:
-  store: \${OTP_STORE:memory}
-
+server:
+  port: ${PORT}
+  error:
+    include-message: always
+    include-binding-errors: always
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics,prometheus
   endpoint:
     health:
+      show-details: always
       probes:
         enabled: true
-  health:
-    vault:
-      enabled: \${VAULT_ENABLED:false}
+
+vault:
+  enabled: \${VAULT_ENABLED:false}
 
 app:
   otp:
-    ttl-seconds: \${OTP_TTL_SECONDS:300}
-    max-attempts: \${OTP_MAX_ATTEMPTS:5}
-    lock-seconds: \${OTP_LOCK_SECONDS:1800}
+    ttl-seconds: \${OTP_TTL:300}
+    length: \${OTP_LENGTH:6}
+    max-attempts: \${OTP_MAX_ATTEMPTS:3}
+    lock-minutes: \${OTP_LOCK_MINUTES:30}
   locale:
     local-country-code: \${LOCAL_COUNTRY_CODE:+221}
-
-  # Vault Transit HMAC
   vault:
     transit-key: \${VAULT_TRANSIT_KEY:otp-hmac}
-
-  # SMSEAGLE (Basic Auth)
   smseagle:
-    base-url: \${SMSEAGLE_BASE_URL:https://smseagle.local}
-    username: \${SMSEAGLE_USER:}
-    password: \${SMSEAGLE_PASS:}
-    sms-path: \${SMSEAGLE_SMS_PATH:/api/v2/messages/sms}
+    base-url: \${SMSEAGLE_URL:http://smseagle:8080}
+    username: \${SMSEAGLE_USERNAME:admin}
+    password: \${SMSEAGLE_PASSWORD:admin}
 EOF
 
-# Profils
+# Profil dev
 cat > "$RES_MAIN/application-dev.yml" <<EOF
-otp:
-  store: memory
 spring:
-  cloud:
-    vault:
-      enabled: false
+  data:
+    redis:
+      host: \${REDIS_HOST:localhost}
+      port: \${REDIS_PORT:6379}
+  mail:
+    host: \${SMTP_HOST:localhost}
+    port: \${SMTP_PORT:1025}
+
+vault:
+  enabled: false
+
 logging:
   level:
-    root: INFO
     ${PKG}: DEBUG
-EOF
 
-cat > "$RES_MAIN/application-test.yml" <<EOF
 otp:
   store: memory
-spring:
-  cloud:
-    vault:
-      enabled: false
 EOF
 
+# Profil docker
 cat > "$RES_MAIN/application-docker.yml" <<EOF
-otp:
-  store: redis
 spring:
-  cloud:
-    vault:
-      enabled: \${VAULT_ENABLED:false}
-      uri: \${VAULT_URI:http://vault:8200}
-      authentication: TOKEN
-      token: \${VAULT_TOKEN:}
-EOF
+  data:
+    redis:
+      host: redis
+      port: 6379
+  mail:
+    host: mailhog
+    port: 1025
 
-cat > "$RES_MAIN/application-kubernetes.yml" <<EOF
+vault:
+  enabled: true
+
+logging:
+  level:
+    ${PKG}: INFO
+
 otp:
   store: redis
-spring:
-  cloud:
+
+management:
+  health:
     vault:
       enabled: true
-      # Si Vault est dans le namespace "vault":
-      uri: \${VAULT_URI:http://vault.vault.svc:8200}
-      # Si Vault est dans le même namespace que l'app, override VAULT_URI à "http://vault:8200"
-      authentication: KUBERNETES
-      kubernetes:
-        role: \${VAULT_K8S_ROLE:${NAME}}
-        kubernetes-path: \${VAULT_K8S_MOUNT:kubernetes}
-      kv:
-        enabled: true
-        backend: secret
-        default-context: ${NAME}
 EOF
 
-cat > "$RES_MAIN/application-qualif.yml" <<EOF
-spring:
-  profiles:
-    include: kubernetes
-EOF
+# ============================================
+# 3. Code Java
+# ============================================
+log_info "Génération du code Java..."
 
-cat > "$RES_MAIN/application-preprod.yml" <<EOF
-spring:
-  profiles:
-    include: kubernetes
-EOF
-
-cat > "$RES_MAIN/application-prod.yml" <<EOF
-spring:
-  profiles:
-    include: kubernetes
-EOF
-
-# -----------------------------
-# Dockerfile (multi-stage, OpenShift-friendly)
-# -----------------------------
-cat > "$BASE/docker/Dockerfile" <<'EOF'
-# syntax=docker/dockerfile:1
-
-FROM maven:3.9-eclipse-temurin-21 AS build
-WORKDIR /src
-COPY pom.xml .
-RUN mvn -q -e -DskipTests dependency:go-offline
-COPY src ./src
-RUN mvn -q -e -DskipTests package
-
-FROM eclipse-temurin:21-jre
-WORKDIR /app
-# OpenShift best practice: run as non-root (OpenShift injecte un UID arbitraire)
-RUN addgroup --system app && adduser --system --ingroup app app
-COPY --from=build /src/target/*.jar /app/app.jar
-EXPOSE 8080
-ENV JAVA_OPTS=""
-USER app
-ENTRYPOINT ["sh","-c","java $JAVA_OPTS -jar /app/app.jar"]
-EOF
-
-# -----------------------------
-# OpenShift manifests (kustomize)
-# -----------------------------
-cat > "$BASE/manifests/openshift/kustomization.yaml" <<EOF
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-namespace: ${K8S_NS}
-resources:
-  - serviceaccount.yaml
-  - deployment.yaml
-  - service.yaml
-  - route.yaml
-  - configmap.yaml
-  - secret.yaml
-EOF
-
-cat > "$BASE/manifests/openshift/serviceaccount.yaml" <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ${NAME}-sa
-EOF
-
-cat > "$BASE/manifests/openshift/configmap.yaml" <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: ${NAME}-config
-data:
-  REDIS_HOST: "redis"
-  REDIS_PORT: "6379"
-  LOCAL_COUNTRY_CODE: "+221"
-  OTP_TTL_SECONDS: "300"
-  OTP_MAX_ATTEMPTS: "5"
-  OTP_LOCK_SECONDS: "1800"
-  VAULT_TRANSIT_KEY: "otp-hmac"
-  SMSEAGLE_BASE_URL: "https://smseagle.local"
-  SMSEAGLE_SMS_PATH: "/api/v2/messages/sms"
-  # SMTP_HOST, SMTP_PORT peuvent être mis ici si non sensibles
-EOF
-
-# Secret OpenShift (SANS VAULT_TOKEN en prod “propre”)
-cat > "$BASE/manifests/openshift/secret.yaml" <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ${NAME}-secret
-type: Opaque
-stringData:
-  SMSEAGLE_USER: "CHANGE_ME"
-  SMSEAGLE_PASS: "CHANGE_ME"
-  SMTP_USER: "CHANGE_ME"
-  SMTP_PASS: "CHANGE_ME"
-EOF
-
-cat > "$BASE/manifests/openshift/deployment.yaml" <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ${NAME}
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: ${NAME}
-  template:
-    metadata:
-      labels:
-        app: ${NAME}
-    spec:
-      serviceAccountName: ${NAME}-sa
-      containers:
-        - name: ${NAME}
-          image: ${IMAGE}
-          imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: 8080
-          env:
-            # Profil prod (inclut kubernetes -> Vault K8S auth)
-            - name: SPRING_PROFILES_ACTIVE
-              value: "prod"
-            - name: VAULT_ENABLED
-              value: "true"
-            - name: OTP_STORE
-              value: "redis"
-
-            # Vault (Kubernetes auth)
-            - name: VAULT_URI
-              value: "http://vault.vault.svc:8200"
-            - name: VAULT_K8S_ROLE
-              value: "${NAME}"
-            - name: VAULT_K8S_MOUNT
-              value: "kubernetes"
-
-          envFrom:
-            - configMapRef:
-                name: ${NAME}-config
-            - secretRef:
-                name: ${NAME}-secret
-          readinessProbe:
-            httpGet:
-              path: /actuator/health/readiness
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /actuator/health/liveness
-              port: 8080
-            initialDelaySeconds: 20
-            periodSeconds: 20
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "256Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
-EOF
-
-cat > "$BASE/manifests/openshift/service.yaml" <<EOF
-apiVersion: v1
-kind: Service
-metadata:
-  name: ${NAME}
-spec:
-  selector:
-    app: ${NAME}
-  ports:
-    - name: http
-      port: 80
-      targetPort: 8080
-EOF
-
-cat > "$BASE/manifests/openshift/route.yaml" <<EOF
-apiVersion: route.openshift.io/v1
-kind: Route
-metadata:
-  name: ${NAME}
-spec:
-  to:
-    kind: Service
-    name: ${NAME}
-  port:
-    targetPort: http
-  tls:
-    termination: edge
-EOF
-if [[ -n "$ROUTE_HOST" ]]; then
-  sed -i "s/spec:/spec:\n  host: ${ROUTE_HOST}/" "$BASE/manifests/openshift/route.yaml"
-fi
-
-# -----------------------------
-# Java sources
-# -----------------------------
-cat > "${SRC_MAIN}/OtpAuthServiceApplication.java" <<EOF
+# Application principale
+cat > "${SRC_MAIN}/OtpAuthApplication.java" <<EOF
 package ${PKG};
 
 import org.springframework.boot.SpringApplication;
@@ -525,17 +282,19 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 
 @SpringBootApplication
 @EnableConfigurationProperties(AppProps.class)
-public class OtpAuthServiceApplication {
-  public static void main(String[] args) {
-    SpringApplication.run(OtpAuthServiceApplication.class, args);
-  }
+public class OtpAuthApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(OtpAuthApplication.class, args);
+    }
 }
 EOF
 
+# AppProps
 cat > "${SRC_MAIN}/AppProps.java" <<EOF
 package ${PKG};
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
 
 @ConfigurationProperties(prefix = "app")
 public record AppProps(
@@ -544,54 +303,60 @@ public record AppProps(
     Vault vault,
     Smseagle smseagle
 ) {
-  public long otpTtlSeconds() { return otp.ttlSeconds(); }
-  public int maxAttempts() { return otp.maxAttempts(); }
-  public long lockSeconds() { return otp.lockSeconds(); }
-  public String localCountryCode() { return locale.localCountryCode(); }
-
-  public String vaultTransitKey() { return vault.transitKey(); }
-
-  public String smseagleBaseUrl() { return smseagle.baseUrl(); }
-  public String smseagleUsername() { return smseagle.username(); }
-  public String smseaglePassword() { return smseagle.password(); }
-  public String smseagleSmsPath() { return smseagle.smsPath(); }
-
-  public record Otp(long ttlSeconds, int maxAttempts, long lockSeconds) {}
-  public record Locale(String localCountryCode) {}
-  public record Vault(String transitKey) {}
-  public record Smseagle(String baseUrl, String username, String password, String smsPath) {}
+    public record Otp(
+        @DefaultValue("300") long ttlSeconds,
+        @DefaultValue("6") int length,
+        @DefaultValue("3") int maxAttempts,
+        @DefaultValue("30") long lockMinutes
+    ) {}
+    
+    public record Locale(
+        @DefaultValue("+221") String localCountryCode
+    ) {}
+    
+    public record Vault(
+        @DefaultValue("otp-hmac") String transitKey
+    ) {}
+    
+    public record Smseagle(
+        String baseUrl,
+        String username,
+        String password
+    ) {}
 }
 EOF
 
+# Enums
 cat > "${SRC_MAIN}/Channel.java" <<EOF
 package ${PKG};
 
-public enum Channel { SMS, EMAIL }
+public enum Channel {
+    SMS, EMAIL
+}
 EOF
 
-cat > "${SRC_MAIN}/Destination.java" <<EOF
-package ${PKG};
-
-public record Destination(Channel channel, String value) {}
-EOF
-
-cat > "${SRC_MAIN}/dto/RegisterStartRequest.java" <<EOF
+# DTOs
+cat > "${SRC_MAIN}/dto/OtpRequest.java" <<EOF
 package ${PKG}.dto;
 
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Email;
 
-public record RegisterStartRequest(
+public record OtpRequest(
+    @Pattern(regexp = "^\\\\+?[0-9]{10,15}\$", message = "Numéro de téléphone invalide")
     String phone,
-    @Email String email
+    
+    @Email(message = "Email invalide")
+    String email
 ) {}
 EOF
 
-cat > "${SRC_MAIN}/dto/RegisterStartResponse.java" <<EOF
+cat > "${SRC_MAIN}/dto/OtpResponse.java" <<EOF
 package ${PKG}.dto;
 
 import ${PKG}.Channel;
 
-public record RegisterStartResponse(
+public record OtpResponse(
     String challengeId,
     Channel channel,
     String maskedDestination,
@@ -599,64 +364,573 @@ public record RegisterStartResponse(
 ) {}
 EOF
 
-cat > "${SRC_MAIN}/dto/VerifyOtpRequest.java" <<EOF
+cat > "${SRC_MAIN}/dto/VerifyRequest.java" <<EOF
 package ${PKG}.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
 
-public record VerifyOtpRequest(
+public record VerifyRequest(
     @NotBlank String challengeId,
-    @NotBlank @Pattern(regexp="\\\\d{6}") String code
+    @NotBlank @Pattern(regexp = "^[0-9]{6}\$") String code
 ) {}
 EOF
 
-cat > "${SRC_MAIN}/dto/VerifyOtpResponse.java" <<EOF
+cat > "${SRC_MAIN}/dto/VerifyResponse.java" <<EOF
 package ${PKG}.dto;
 
-public record VerifyOtpResponse(boolean verified, String next) {}
+public record VerifyResponse(
+    boolean verified,
+    String message
+) {}
 EOF
 
-cat > "${SRC_MAIN}/AuthController.java" <<EOF
+# Controller
+cat > "${SRC_MAIN}/OtpController.java" <<EOF
 package ${PKG};
 
-import ${PKG}.dto.RegisterStartRequest;
-import ${PKG}.dto.RegisterStartResponse;
-import ${PKG}.dto.VerifyOtpRequest;
-import ${PKG}.dto.VerifyOtpResponse;
-
+import ${PKG}.dto.OtpRequest;
+import ${PKG}.dto.OtpResponse;
+import ${PKG}.dto.VerifyRequest;
+import ${PKG}.dto.VerifyResponse;
 import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequestMapping("/auth/register")
-public class AuthController {
+public class OtpController {
 
-  private final OtpOrchestratorService orchestrator;
+    private final OtpOrchestrator orchestrator;
 
-  public AuthController(OtpOrchestratorService orchestrator) {
-    this.orchestrator = orchestrator;
-  }
+    public OtpController(OtpOrchestrator orchestrator) {
+        this.orchestrator = orchestrator;
+    }
 
-  @PostMapping("/start")
-  public RegisterStartResponse start(@Valid @RequestBody RegisterStartRequest req) {
-    return orchestrator.startChallenge(req);
-  }
+    @PostMapping("/start")
+    public ResponseEntity<OtpResponse> start(@Valid @RequestBody OtpRequest request) {
+        OtpResponse response = orchestrator.startChallenge(request);
+        return ResponseEntity.ok(response);
+    }
 
-  @PostMapping("/verify")
-  public VerifyOtpResponse verify(@Valid @RequestBody VerifyOtpRequest req) {
-    boolean ok = orchestrator.verify(req.challengeId(), req.code());
-    return new VerifyOtpResponse(ok, ok ? "CREATE_ACCOUNT" : "RETRY");
-  }
+    @PostMapping("/verify")
+    public ResponseEntity<VerifyResponse> verify(@Valid @RequestBody VerifyRequest request) {
+        boolean verified = orchestrator.verifyChallenge(request.challengeId(), request.code());
+        String message = verified ? "Code validé avec succès" : "Code invalide ou expiré";
+        return ResponseEntity.ok(new VerifyResponse(verified, message));
+    }
 }
 EOF
 
-# Notify interfaces + impl
+# ============================================
+# Interface MacService et implémentations
+# ============================================
+
+# Interface MacService
+cat > "${SRC_MAIN}/vault/MacService.java" <<EOF
+package ${PKG}.vault;
+
+public interface MacService {
+    String hmac(String challengeId, String destination, String code);
+}
+EOF
+
+# Implémentation locale (sans Vault)
+cat > "${SRC_MAIN}/vault/LocalMacService.java" <<EOF
+package ${PKG}.vault;
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
+@Service
+@ConditionalOnProperty(name = "vault.enabled", havingValue = "false", matchIfMissing = true)
+public class LocalMacService implements MacService {
+
+    private final byte[] secret;
+
+    public LocalMacService() {
+        // Secret DEV uniquement (ne pas utiliser en prod)
+        String s = System.getenv().getOrDefault("LOCAL_HMAC_SECRET", "dev-local-secret-change-me");
+        this.secret = s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Override
+    public String hmac(String challengeId, String destination, String code) {
+        try {
+            String msg = challengeId + ":" + destination + ":" + code;
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secret, "HmacSHA256"));
+            byte[] out = mac.doFinal(msg.getBytes(StandardCharsets.UTF_8));
+            return "local:v1:" + Base64.getEncoder().encodeToString(out);
+        } catch (Exception e) {
+            throw new IllegalStateException("Local HMAC failed", e);
+        }
+    }
+}
+EOF
+
+# Implémentation Vault (via API REST)
+cat > "${SRC_MAIN}/vault/VaultTransitMacService.java" <<EOF
+package ${PKG}.vault;
+
+import heritage.africa.otp.AppProps;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.Map;
+
+@Service
+@ConditionalOnProperty(name = "vault.enabled", havingValue = "true")
+public class VaultTransitMacService implements MacService {
+
+    private final RestClient vaultClient;
+    private final AppProps props;
+
+    public VaultTransitMacService(AppProps props) {
+        this.props = props;
+
+        String vaultUri = System.getenv().getOrDefault("VAULT_URI", "http://vault:8200");
+        String token = System.getenv().getOrDefault("VAULT_TOKEN", "");
+        
+        RestClient.Builder builder = RestClient.builder()
+            .baseUrl(vaultUri)
+            .defaultHeaders(h -> {
+                h.setContentType(MediaType.APPLICATION_JSON);
+            });
+        
+        // N'ajouter le token que s'il est present
+        if (!token.isBlank()) {
+            builder = builder.defaultHeaders(h -> h.set("X-Vault-Token", token));
+        }
+
+        this.vaultClient = builder.build();
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public String hmac(String challengeId, String destination, String code) {
+        String msg = challengeId + ":" + destination + ":" + code;
+        String inputB64 = Base64.getEncoder().encodeToString(msg.getBytes(StandardCharsets.UTF_8));
+
+        Map<String, Object> req = Map.of(
+            "input", inputB64,
+            "algorithm", "sha2-256"
+        );
+
+        Map<String, Object> resp = vaultClient.post()
+            .uri("/v1/transit/hmac/{key}", props.vault().transitKey())
+            .body(req)
+            .retrieve()
+            .body(Map.class);
+
+        if (resp == null || resp.get("data") == null) {
+            throw new IllegalStateException("Vault transit response empty");
+        }
+
+        Map<String, Object> data = (Map<String, Object>) resp.get("data");
+        Object h = data.get("hmac");
+        if (h == null) {
+            throw new IllegalStateException("Vault transit response missing hmac");
+        }
+        return h.toString();
+    }
+}
+EOF
+
+# ============================================
+# Service OTP
+# ============================================
+cat > "${SRC_MAIN}/OtpService.java" <<EOF
+package ${PKG};
+
+import ${PKG}.otp.OtpStore;
+import ${PKG}.vault.MacService;
+import org.springframework.stereotype.Service;
+
+import java.security.SecureRandom;
+import java.time.Instant;
+import java.util.UUID;
+
+@Service
+public class OtpService {
+
+    private final SecureRandom random = new SecureRandom();
+    private final OtpStore otpStore;
+    private final MacService macService;
+    private final AppProps properties;
+
+    public OtpService(OtpStore otpStore, MacService macService, AppProps properties) {
+        this.otpStore = otpStore;
+        this.macService = macService;
+        this.properties = properties;
+    }
+
+    public OtpChallenge createChallenge(String destination, Channel channel) {
+        String challengeId = UUID.randomUUID().toString();
+        String code = generateCode();
+        String hmac = macService.hmac(challengeId, destination, code);
+        
+        otpStore.save(challengeId, destination, channel, hmac, properties.otp().ttlSeconds());
+        
+        return new OtpChallenge(challengeId, code);
+    }
+
+    public boolean verifyChallenge(String challengeId, String code) {
+        var record = otpStore.find(challengeId);
+        if (record.isEmpty()) {
+            return false;
+        }
+
+        var otpRecord = record.get();
+        
+        if (otpRecord.lockedUntil() != null && 
+            Instant.now().isBefore(otpRecord.lockedUntil())) {
+            return false;
+        }
+
+        if (otpRecord.attempts() >= properties.otp().maxAttempts()) {
+            Instant lockUntil = Instant.now().plusSeconds(properties.otp().lockMinutes() * 60);
+            otpStore.lock(challengeId, lockUntil);
+            return false;
+        }
+
+        String expectedHmac = macService.hmac(
+            challengeId, 
+            otpRecord.destination(), 
+            code
+        );
+
+        boolean isValid = constantTimeEquals(expectedHmac, otpRecord.hmac());
+
+        if (isValid) {
+            otpStore.delete(challengeId);
+            return true;
+        } else {
+            otpStore.incrementAttempts(challengeId);
+            return false;
+        }
+    }
+
+    private String generateCode() {
+        int code = random.nextInt((int) Math.pow(10, properties.otp().length()));
+        return String.format("%0" + properties.otp().length() + "d", code);
+    }
+
+    private boolean constantTimeEquals(String a, String b) {
+        if (a == null || b == null) return false;
+        if (a.length() != b.length()) return false;
+        
+        int result = 0;
+        for (int i = 0; i < a.length(); i++) {
+            result |= a.charAt(i) ^ b.charAt(i);
+        }
+        return result == 0;
+    }
+
+    public record OtpChallenge(String challengeId, String code) {}
+}
+EOF
+
+# ============================================
+# Store interfaces et implémentations
+# ============================================
+cat > "${SRC_MAIN}/otp/OtpStore.java" <<EOF
+package ${PKG}.otp;
+
+import ${PKG}.Channel;
+import java.time.Instant;
+import java.util.Optional;
+
+public interface OtpStore {
+    void save(String challengeId, String destination, Channel channel, String hmac, long ttlSeconds);
+    Optional<OtpRecord> find(String challengeId);
+    void incrementAttempts(String challengeId);
+    void lock(String challengeId, Instant lockUntil);
+    void delete(String challengeId);
+
+    record OtpRecord(
+        String challengeId,
+        String destination,
+        Channel channel,
+        String hmac,
+        int attempts,
+        Instant lockedUntil,
+        Instant expiresAt
+    ) {}
+}
+EOF
+
+cat > "${SRC_MAIN}/otp/RedisOtpStore.java" <<EOF
+package ${PKG}.otp;
+
+import ${PKG}.Channel;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Repository;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+
+import java.time.Instant;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+@Repository
+@ConditionalOnProperty(name = "otp.store", havingValue = "redis")
+public class RedisOtpStore implements OtpStore {
+
+    private final StringRedisTemplate redis;
+    private static final String KEY_PREFIX = "otp:";
+
+    public RedisOtpStore(StringRedisTemplate redis) {
+        this.redis = redis;
+    }
+
+    @Override
+    public void save(String challengeId, String destination, Channel channel, String hmac, long ttlSeconds) {
+        String key = KEY_PREFIX + challengeId;
+        
+        redis.opsForHash().put(key, "destination", destination);
+        redis.opsForHash().put(key, "channel", channel.name());
+        redis.opsForHash().put(key, "hmac", hmac);
+        redis.opsForHash().put(key, "attempts", "0");
+        redis.expire(key, ttlSeconds, TimeUnit.SECONDS);
+    }
+
+    @Override
+    public Optional<OtpRecord> find(String challengeId) {
+        String key = KEY_PREFIX + challengeId;
+        var entries = redis.opsForHash().entries(key);
+        
+        if (entries.isEmpty()) {
+            return Optional.empty();
+        }
+
+        String destination = (String) entries.get("destination");
+        Channel channel = Channel.valueOf((String) entries.get("channel"));
+        String hmac = (String) entries.get("hmac");
+        int attempts = Integer.parseInt((String) entries.getOrDefault("attempts", "0"));
+        
+        String lockedUntilStr = (String) entries.get("lockedUntil");
+        Instant lockedUntil = lockedUntilStr != null ? Instant.parse(lockedUntilStr) : null;
+        
+        Long ttl = redis.getExpire(key, TimeUnit.SECONDS);
+        Instant expiresAt = Instant.now().plusSeconds(ttl != null ? ttl : 0);
+
+        return Optional.of(new OtpRecord(
+            challengeId, destination, channel, hmac, attempts, lockedUntil, expiresAt
+        ));
+    }
+
+    @Override
+    public void incrementAttempts(String challengeId) {
+        String key = KEY_PREFIX + challengeId;
+        redis.opsForHash().increment(key, "attempts", 1);
+    }
+
+    @Override
+    public void lock(String challengeId, Instant lockUntil) {
+        String key = KEY_PREFIX + challengeId;
+        redis.opsForHash().put(key, "lockedUntil", lockUntil.toString());
+    }
+
+    @Override
+    public void delete(String challengeId) {
+        redis.delete(KEY_PREFIX + challengeId);
+    }
+}
+EOF
+
+cat > "${SRC_MAIN}/otp/InMemoryOtpStore.java" <<EOF
+package ${PKG}.otp;
+
+import ${PKG}.Channel;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Repository;
+
+import java.time.Instant;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Repository
+@ConditionalOnProperty(name = "otp.store", havingValue = "memory", matchIfMissing = true)
+public class InMemoryOtpStore implements OtpStore {
+
+    private final Map<String, OtpRecord> store = new ConcurrentHashMap<>();
+
+    @Override
+    public void save(String challengeId, String destination, Channel channel, String hmac, long ttlSeconds) {
+        OtpRecord record = new OtpRecord(
+            challengeId,
+            destination,
+            channel,
+            hmac,
+            0,
+            null,
+            Instant.now().plusSeconds(ttlSeconds)
+        );
+        store.put(challengeId, record);
+    }
+
+    @Override
+    public Optional<OtpRecord> find(String challengeId) {
+        OtpRecord record = store.get(challengeId);
+        if (record == null || Instant.now().isAfter(record.expiresAt())) {
+            store.remove(challengeId);
+            return Optional.empty();
+        }
+        return Optional.of(record);
+    }
+
+    @Override
+    public void incrementAttempts(String challengeId) {
+        store.computeIfPresent(challengeId, (k, v) -> new OtpRecord(
+            v.challengeId(),
+            v.destination(),
+            v.channel(),
+            v.hmac(),
+            v.attempts() + 1,
+            v.lockedUntil(),
+            v.expiresAt()
+        ));
+    }
+
+    @Override
+    public void lock(String challengeId, Instant lockUntil) {
+        store.computeIfPresent(challengeId, (k, v) -> new OtpRecord(
+            v.challengeId(),
+            v.destination(),
+            v.channel(),
+            v.hmac(),
+            v.attempts(),
+            lockUntil,
+            v.expiresAt()
+        ));
+    }
+
+    @Override
+    public void delete(String challengeId) {
+        store.remove(challengeId);
+    }
+}
+EOF
+
+# ============================================
+# Orchestrator
+# ============================================
+cat > "${SRC_MAIN}/OtpOrchestrator.java" <<EOF
+package ${PKG};
+
+import ${PKG}.dto.OtpRequest;
+import ${PKG}.dto.OtpResponse;
+import ${PKG}.notify.EmailSender;
+import ${PKG}.notify.SmsSender;
+import org.springframework.stereotype.Service;
+
+@Service
+public class OtpOrchestrator {
+
+    private final OtpService otpService;
+    private final SmsSender smsSender;
+    private final EmailSender emailSender;
+    private final AppProps props;
+
+    public OtpOrchestrator(
+            OtpService otpService,
+            SmsSender smsSender,
+            EmailSender emailSender,
+            AppProps props) {
+        this.otpService = otpService;
+        this.smsSender = smsSender;
+        this.emailSender = emailSender;
+        this.props = props;
+    }
+
+    public OtpResponse startChallenge(OtpRequest request) {
+        Destination destination = determineDestination(request);
+        OtpService.OtpChallenge challenge = otpService.createChallenge(
+            destination.value(), 
+            destination.channel()
+        );
+
+        String message = String.format(
+            "Votre code de vérification est: %s (valable %d minutes)",
+            challenge.code(),
+            props.otp().ttlSeconds() / 60
+        );
+
+        if (destination.channel() == Channel.SMS) {
+            smsSender.send(destination.value(), message);
+        } else {
+            emailSender.send(destination.value(), "Code de vérification", message);
+        }
+
+        return new OtpResponse(
+            challenge.challengeId(),
+            destination.channel(),
+            maskDestination(destination),
+            props.otp().ttlSeconds()
+        );
+    }
+
+    public boolean verifyChallenge(String challengeId, String code) {
+        return otpService.verifyChallenge(challengeId, code);
+    }
+
+    private Destination determineDestination(OtpRequest request) {
+        if (request.phone() != null && !request.phone().isEmpty()) {
+            String phone = normalizePhone(request.phone());
+            if (phone.startsWith(props.locale().localCountryCode())) {
+                return new Destination(Channel.SMS, phone);
+            }
+        }
+        if (request.email() != null && !request.email().isEmpty()) {
+            return new Destination(Channel.EMAIL, normalizeEmail(request.email()));
+        }
+        throw new IllegalArgumentException("Aucune destination valide fournie");
+    }
+
+    private String normalizePhone(String phone) {
+        return phone.replaceAll("[^0-9+]", "");
+    }
+
+    private String normalizeEmail(String email) {
+        return email.trim().toLowerCase();
+    }
+
+    private String maskDestination(Destination dest) {
+        String value = dest.value();
+        if (dest.channel() == Channel.EMAIL) {
+            int atIndex = value.indexOf('@');
+            if (atIndex > 1) {
+                return value.charAt(0) + "***" + value.substring(atIndex - 1);
+            }
+            return "***" + value.substring(atIndex);
+        } else {
+            if (value.length() <= 6) return "****";
+            return value.substring(0, 4) + "****" + value.substring(value.length() - 2);
+        }
+    }
+
+    private record Destination(Channel channel, String value) {}
+}
+EOF
+
+# ============================================
+# Notifications
+# ============================================
 cat > "${SRC_MAIN}/notify/SmsSender.java" <<EOF
 package ${PKG}.notify;
 
 public interface SmsSender {
-  void send(String phoneE164, String message);
+    void send(String phoneNumber, String message);
 }
 EOF
 
@@ -664,7 +938,51 @@ cat > "${SRC_MAIN}/notify/EmailSender.java" <<EOF
 package ${PKG}.notify;
 
 public interface EmailSender {
-  void send(String to, String subject, String body);
+    void send(String to, String subject, String body);
+}
+EOF
+
+cat > "${SRC_MAIN}/notify/SmseagleSender.java" <<EOF
+package ${PKG}.notify;
+
+import ${PKG}.AppProps;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+
+import java.util.Base64;
+import java.util.Map;
+
+@Service
+public class SmseagleSender implements SmsSender {
+
+    private final RestClient restClient;
+
+    public SmseagleSender(AppProps props) {
+        String auth = props.smseagle().username() + ":" + props.smseagle().password();
+        String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
+        
+        this.restClient = RestClient.builder()
+            .baseUrl(props.smseagle().baseUrl())
+            .defaultHeader(HttpHeaders.AUTHORIZATION, "Basic " + encodedAuth)
+            .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+            .build();
+    }
+
+    @Override
+    public void send(String phoneNumber, String message) {
+        Map<String, Object> request = Map.of(
+            "to", phoneNumber,
+            "message", message
+        );
+
+        restClient.post()
+            .uri("/send")
+            .body(request)
+            .retrieve()
+            .toBodilessEntity();
+    }
 }
 EOF
 
@@ -677,725 +995,621 @@ import org.springframework.stereotype.Service;
 
 @Service
 public class SmtpEmailSender implements EmailSender {
-  private final JavaMailSender mailSender;
 
-  public SmtpEmailSender(JavaMailSender mailSender) {
-    this.mailSender = mailSender;
-  }
+    private final JavaMailSender mailSender;
 
-  @Override
-  public void send(String to, String subject, String body) {
-    SimpleMailMessage msg = new SimpleMailMessage();
-    msg.setTo(to);
-    msg.setSubject(subject);
-    msg.setText(body);
-    mailSender.send(msg);
-  }
-}
-EOF
-
-# SMSEAGLE BasicAuth client (RestClient)
-cat > "${SRC_MAIN}/notify/SmseagleSmsSender.java" <<EOF
-package ${PKG}.notify;
-
-import ${PKG}.AppProps;
-import org.springframework.http.MediaType;
-import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestClient;
-
-import java.util.Map;
-
-@Service
-public class SmseagleSmsSender implements SmsSender {
-
-  // pas final -> testable via ReflectionTestUtils
-  private RestClient client;
-  private final AppProps props;
-
-  public SmseagleSmsSender(AppProps props) {
-    this.props = props;
-    this.client = RestClient.builder()
-        .baseUrl(props.smseagleBaseUrl())
-        .defaultHeaders(h -> {
-          h.setBasicAuth(props.smseagleUsername(), props.smseaglePassword());
-          h.setContentType(MediaType.APPLICATION_JSON);
-        })
-        .build();
-  }
-
-  @Override
-  public void send(String phoneE164, String message) {
-    client.post()
-        .uri(props.smseagleSmsPath())
-        .body(Map.of("to", phoneE164, "text", message))
-        .retrieve()
-        .toBodilessEntity();
-  }
-}
-EOF
-
-# MacService interface + impls (Vault / Local)
-cat > "${SRC_MAIN}/vault/MacService.java" <<EOF
-package ${PKG}.vault;
-
-public interface MacService {
-  String hmac(String challengeId, String destination, String code);
-}
-EOF
-
-cat > "${SRC_MAIN}/vault/VaultMacService.java" <<EOF
-package ${PKG}.vault;
-
-import ${PKG}.AppProps;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.stereotype.Service;
-import org.springframework.vault.core.VaultTemplate;
-import org.springframework.vault.support.VaultResponse;
-
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
-import java.util.Map;
-
-@Service
-@ConditionalOnProperty(name = "spring.cloud.vault.enabled", havingValue = "true")
-public class VaultMacService implements MacService {
-
-  private final VaultTemplate vault;
-  private final AppProps props;
-
-  public VaultMacService(VaultTemplate vault, AppProps props) {
-    this.vault = vault;
-    this.props = props;
-  }
-
-  @Override
-  public String hmac(String challengeId, String destination, String code) {
-    String msg = challengeId + ":" + destination + ":" + code;
-    String inputB64 = Base64.getEncoder().encodeToString(msg.getBytes(StandardCharsets.UTF_8));
-
-    Map<String, Object> req = Map.of(
-        "input", inputB64,
-        "algorithm", "sha2-256"
-    );
-
-    VaultResponse resp = vault.write("transit/hmac/" + props.vaultTransitKey(), req);
-    if (resp == null || resp.getData() == null) {
-      throw new IllegalStateException("Vault transit response empty");
+    public SmtpEmailSender(JavaMailSender mailSender) {
+        this.mailSender = mailSender;
     }
 
-    Object h = resp.getData().get("hmac");
-    if (h == null) throw new IllegalStateException("Vault transit response missing hmac");
-    return h.toString();
-  }
+    @Override
+    public void send(String to, String subject, String body) {
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setTo(to);
+        message.setSubject(subject);
+        message.setText(body);
+        mailSender.send(message);
+    }
 }
 EOF
 
-cat > "${SRC_MAIN}/vault/LocalMacService.java" <<EOF
-package ${PKG}.vault;
-
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.stereotype.Service;
-
-@Service
-@ConditionalOnProperty(name = "spring.cloud.vault.enabled", havingValue = "false", matchIfMissing = true)
-public class LocalMacService implements MacService {
-
-  @Override
-  public String hmac(String challengeId, String destination, String code) {
-    return "LOCAL(" + challengeId + ":" + destination + ":" + code + ")";
-  }
-}
-EOF
-
-
-# OTP store abstraction + Redis impl + InMemory
-cat > "${SRC_MAIN}/otp/OtpStore.java" <<EOF
-package ${PKG}.otp;
-
-import ${PKG}.Channel;
-
-import java.util.Optional;
-
-public interface OtpStore {
-  void put(String challengeId, String destination, Channel channel, String codeMac, long ttlSeconds);
-  Optional<OtpRecord> get(String challengeId);
-  void incrementAttempts(String challengeId);
-  void lock(String challengeId, long lockUntilEpochSec, long ttlSeconds);
-  void delete(String challengeId);
-
-  record OtpRecord(String destination, Channel channel, String codeMac, int attempts, Long lockedUntilEpochSec) {}
-}
-EOF
-
-cat > "${SRC_MAIN}/otp/RedisOtpStore.java" <<EOF
-package ${PKG}.otp;
-
-import ${PKG}.Channel;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Component;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-
-import java.time.Duration;
-import java.util.Map;
-import java.util.Optional;
-
-@Component("redisOtpStore")
-@ConditionalOnProperty(name = "otp.store", havingValue = "redis")
-public class RedisOtpStore implements OtpStore {
-
-  private final StringRedisTemplate redis;
-
-  public RedisOtpStore(StringRedisTemplate redis) {
-    this.redis = redis;
-  }
-
-  private String key(String challengeId) { return "otp:ch:" + challengeId; }
-
-  @Override
-  public void put(String challengeId, String destination, Channel channel, String codeMac, long ttlSeconds) {
-    String k = key(challengeId);
-    redis.opsForHash().put(k, "dest", destination);
-    redis.opsForHash().put(k, "channel", channel.name());
-    redis.opsForHash().put(k, "code_mac", codeMac);
-    redis.opsForHash().put(k, "attempts", "0");
-    redis.expire(k, Duration.ofSeconds(ttlSeconds));
-  }
-
-  @Override
-  public Optional<OtpRecord> get(String challengeId) {
-    String k = key(challengeId);
-    Map<Object, Object> m = redis.opsForHash().entries(k);
-    if (m == null || m.isEmpty()) return Optional.empty();
-
-    String dest = (String) m.get("dest");
-    String channel = (String) m.get("channel");
-    String codeMac = (String) m.get("code_mac");
-    int attempts = Integer.parseInt((String) m.getOrDefault("attempts", "0"));
-    String lockedUntil = (String) m.get("locked_until");
-
-    return Optional.of(new OtpRecord(
-        dest,
-        Channel.valueOf(channel),
-        codeMac,
-        attempts,
-        lockedUntil == null ? null : Long.parseLong(lockedUntil)
-    ));
-  }
-
-  @Override
-  public void incrementAttempts(String challengeId) {
-    String k = key(challengeId);
-    String cur = (String) redis.opsForHash().get(k, "attempts");
-    int v = cur == null ? 0 : Integer.parseInt(cur);
-    redis.opsForHash().put(k, "attempts", Integer.toString(v + 1));
-  }
-
-  @Override
-  public void lock(String challengeId, long lockUntilEpochSec, long ttlSeconds) {
-    String k = key(challengeId);
-    redis.opsForHash().put(k, "locked_until", Long.toString(lockUntilEpochSec));
-    redis.expire(k, Duration.ofSeconds(ttlSeconds));
-  }
-
-  @Override
-  public void delete(String challengeId) {
-    redis.delete(key(challengeId));
-  }
-}
-EOF
-
-cat > "${SRC_MAIN}/otp/InMemoryOtpStore.java" <<EOF
-package ${PKG}.otp;
-
-import ${PKG}.Channel;
-import org.springframework.stereotype.Component;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-
-import java.time.Instant;
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-
-@Component("inMemoryOtpStore")
-@ConditionalOnProperty(name = "otp.store", havingValue = "memory", matchIfMissing = true)
-public class InMemoryOtpStore implements OtpStore {
-
-  private static class Entry {
-    String dest;
-    Channel channel;
-    String mac;
-    int attempts;
-    Long lockedUntil;
-    long expiresAt;
-  }
-
-  private final Map<String, Entry> map = new ConcurrentHashMap<>();
-
-  @Override
-  public void put(String challengeId, String destination, Channel channel, String codeMac, long ttlSeconds) {
-    Entry e = new Entry();
-    e.dest = destination;
-    e.channel = channel;
-    e.mac = codeMac;
-    e.attempts = 0;
-    e.lockedUntil = null;
-    e.expiresAt = Instant.now().getEpochSecond() + ttlSeconds;
-    map.put(challengeId, e);
-  }
-
-  @Override
-  public Optional<OtpRecord> get(String challengeId) {
-    Entry e = map.get(challengeId);
-    if (e == null) return Optional.empty();
-    long now = Instant.now().getEpochSecond();
-    if (now >= e.expiresAt) { map.remove(challengeId); return Optional.empty(); }
-    return Optional.of(new OtpRecord(e.dest, e.channel, e.mac, e.attempts, e.lockedUntil));
-  }
-
-  @Override
-  public void incrementAttempts(String challengeId) {
-    Entry e = map.get(challengeId);
-    if (e != null) e.attempts++;
-  }
-
-  @Override
-  public void lock(String challengeId, long lockUntilEpochSec, long ttlSeconds) {
-    Entry e = map.get(challengeId);
-    if (e != null) {
-      e.lockedUntil = lockUntilEpochSec;
-      e.expiresAt = Instant.now().getEpochSecond() + ttlSeconds;
-    }
-  }
-
-  @Override
-  public void delete(String challengeId) {
-    map.remove(challengeId);
-  }
-}
-EOF
-
-# OTP Service
-cat > "${SRC_MAIN}/OtpService.java" <<EOF
-package ${PKG};
-
-import ${PKG}.otp.OtpStore;
-import ${PKG}.otp.OtpStore.OtpRecord;
-import ${PKG}.vault.VaultTransitMacService;
-import org.springframework.stereotype.Service;
-
-import java.security.SecureRandom;
-import java.time.Instant;
-import java.util.UUID;
-
-@Service
-public class OtpService {
-
-  private final SecureRandom random = new SecureRandom();
-  private final OtpStore store;
-  private final VaultTransitMacService mac;
-  private final AppProps props;
-
-  public OtpService(OtpStore store, VaultTransitMacService mac, AppProps props) {
-    this.store = store;
-    this.mac = mac;
-    this.props = props;
-  }
-
-  public OtpChallenge create(Destination dest) {
-    String challengeId = UUID.randomUUID().toString();
-    String code = String.format("%06d", random.nextInt(1_000_000));
-    String codeMac = mac.hmac(challengeId, dest.value(), code);
-
-    store.put(challengeId, dest.value(), dest.channel(), codeMac, props.otpTtlSeconds());
-    return new OtpChallenge(challengeId, code);
-  }
-
-  public boolean verify(String challengeId, String code) {
-    var opt = store.get(challengeId);
-    if (opt.isEmpty()) return false;
-
-    OtpRecord r = opt.get();
-    long now = Instant.now().getEpochSecond();
-
-    if (r.lockedUntilEpochSec() != null && now < r.lockedUntilEpochSec()) return false;
-
-    if (r.attempts() >= props.maxAttempts()) {
-      store.lock(challengeId, now + props.lockSeconds(), Math.max(props.lockSeconds(), props.otpTtlSeconds()));
-      return false;
-    }
-
-    String actual = mac.hmac(challengeId, r.destination(), code);
-    boolean ok = constantTimeEquals(r.codeMac(), actual);
-
-    if (ok) {
-      store.delete(challengeId);
-      return true;
-    }
-
-    store.incrementAttempts(challengeId);
-
-    var r2 = store.get(challengeId).orElse(r);
-    if (r2.attempts() >= props.maxAttempts()) {
-      store.lock(challengeId, now + props.lockSeconds(), Math.max(props.lockSeconds(), props.otpTtlSeconds()));
-    }
-
-    return false;
-  }
-
-  private boolean constantTimeEquals(String a, String b) {
-    if (a == null || b == null) return false;
-    if (a.length() != b.length()) return false;
-    int r = 0;
-    for (int i = 0; i < a.length(); i++) r |= a.charAt(i) ^ b.charAt(i);
-    return r == 0;
-  }
-
-  public record OtpChallenge(String challengeId, String code) {}
-}
-EOF
-
-# Orchestrator
-cat > "${SRC_MAIN}/OtpOrchestratorService.java" <<EOF
-package ${PKG};
-
-import ${PKG}.dto.RegisterStartRequest;
-import ${PKG}.dto.RegisterStartResponse;
-import ${PKG}.notify.EmailSender;
-import ${PKG}.notify.SmsSender;
-import org.springframework.stereotype.Service;
-import org.springframework.util.StringUtils;
-
-@Service
-public class OtpOrchestratorService {
-
-  private final OtpService otpService;
-  private final SmsSender smsSender;
-  private final EmailSender emailSender;
-  private final AppProps props;
-
-  public OtpOrchestratorService(OtpService otpService, SmsSender smsSender, EmailSender emailSender, AppProps props) {
-    this.otpService = otpService;
-    this.smsSender = smsSender;
-    this.emailSender = emailSender;
-    this.props = props;
-  }
-
-  public RegisterStartResponse startChallenge(RegisterStartRequest req) {
-    Destination dest = decide(req);
-
-    var ch = otpService.create(dest);
-
-    String msg = "Votre code OTP est: " + ch.code() + " (valable " + (props.otpTtlSeconds()/60) + " min)";
-    if (dest.channel() == Channel.SMS) {
-      smsSender.send(dest.value(), msg);
-    } else {
-      emailSender.send(dest.value(), "Votre code de vérification", msg);
-    }
-
-    return new RegisterStartResponse(ch.challengeId(), dest.channel(), mask(dest), props.otpTtlSeconds());
-  }
-
-  public boolean verify(String challengeId, String code) {
-    return otpService.verify(challengeId, code);
-  }
-
-  private Destination decide(RegisterStartRequest req) {
-    if (StringUtils.hasText(req.phone())) {
-      String p = normalizePhone(req.phone());
-      if (p.startsWith(props.localCountryCode())) {
-        return new Destination(Channel.SMS, p);
-      }
-    }
-    if (StringUtils.hasText(req.email())) {
-      return new Destination(Channel.EMAIL, normalizeEmail(req.email()));
-    }
-    throw new IllegalArgumentException("phone ou email requis");
-  }
-
-  private String normalizePhone(String phone) {
-    return phone.replaceAll("[\\\n\\\r\\\t\\\s\\\-()]", "");
-  }
-
-  private String normalizeEmail(String email) {
-    return email.trim().toLowerCase();
-  }
-
-  private String mask(Destination dest) {
-    String v = dest.value();
-    if (dest.channel() == Channel.EMAIL) {
-      int at = v.indexOf("@");
-      if (at <= 1) return "***" + v.substring(at);
-      return v.substring(0, 1) + "***" + v.substring(at);
-    }
-    if (v.length() <= 4) return "****";
-    return v.substring(0, Math.min(6, v.length()-2)) + "****" + v.substring(v.length()-2);
-  }
-}
-EOF
-
-# -----------------------------
-# Tests unitaires (adaptés VaultTemplate)
-# -----------------------------
+# ============================================
+# 4. Tests
+# ============================================
+log_info "Génération des tests..."
+
+# Test VaultTransitMacService
 cat > "${SRC_TEST}/vault/VaultTransitMacServiceTest.java" <<EOF
 package ${PKG}.vault;
-
-import heritage.africa.otp.AppProps;
-import org.junit.jupiter.api.Test;
-import org.springframework.vault.core.VaultTemplate;
-import org.springframework.vault.support.VaultResponse;
-
-
-import java.util.Map;
-
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.*;
-
-public class VaultTransitMacServiceTest {
-
-  @Test
-  void hmac_callsVaultTransitAndReturnsHmac() {
-    AppProps props = new AppProps(
-        new AppProps.Otp(300,5,1800),
-        new AppProps.Locale("+221"),
-        new AppProps.Vault("otp-hmac"),
-        new AppProps.Smseagle("https://smseagle.local","u","p","/api/v2/messages/sms")
-    );
-
-    VaultResponse vr = new VaultResponse();
-    vr.setData(Map.of("hmac", "vault:v1:abc"));
-    
-    VaultTemplate vault = mock(VaultTemplate.class);
-    when(vault.write(eq("transit/hmac/otp-hmac"), any(Map.class))).thenReturn(vr);
-
-    VaultTransitMacService svc = new VaultTransitMacService(vault, props);
-
-    String h = svc.hmac("cid","+221771234567","123456");
-    assertThat(h).isEqualTo("vault:v1:abc");
-
-    verify(vault, times(1)).write(eq("transit/hmac/otp-hmac"), any(Map.class));
-  }
-}
-EOF
-
-cat > "${SRC_TEST}/notify/SmseagleSmsSenderTest.java" <<EOF
-package ${PKG}.notify;
 
 import ${PKG}.AppProps;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.test.web.client.MockRestServiceServer;
 
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
-
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.*;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
-public class SmseagleSmsSenderTest {
+public class VaultTransitMacServiceTest {
 
   @Test
-  void send_usesBasicAuthHeader() {
-    AppProps props = new AppProps(
-        new AppProps.Otp(300,5,1800),
-        new AppProps.Locale("+221"),
-        new AppProps.Vault("otp-hmac"),
-        new AppProps.Smseagle("http://smseagle.local","user","pass","/api/v2/messages/sms")
-    );
+  void hmac_callsVaultTransitAndReturnsHmac() {
+    // Utiliser des proprietes systeme pour le test
+    System.setProperty("VAULT_URI", "http://vault:8200");
+    System.setProperty("VAULT_TOKEN", "test-token");
+    
+    try {
+      AppProps props = new AppProps(
+          new AppProps.Otp(300, 6, 3, 30),
+          new AppProps.Locale("+221"),
+          new AppProps.Vault("otp-hmac"),
+          new AppProps.Smseagle("https://smseagle.local", "u", "p")
+      );
 
-    SmseagleSmsSender sender = new SmseagleSmsSender(props);
+      // Construire un RestClient base sur RestTemplate pour MockRestServiceServer
+      RestTemplate rt = new RestTemplate();
+      MockRestServiceServer server = MockRestServiceServer.bindTo(rt).build();
 
-    RestTemplate rt = new RestTemplate();
-    MockRestServiceServer server = MockRestServiceServer.bindTo(rt).build();
+      // On remplace le vaultClient interne via reflection (test-friendly)
+      VaultTransitMacService svc = new VaultTransitMacService(props);
+      RestClient testClient = RestClient.builder()
+          .requestFactory(new org.springframework.http.client.ClientHttpRequestFactory() {
+            @Override public org.springframework.http.client.ClientHttpRequest createRequest(java.net.URI uri, org.springframework.http.HttpMethod httpMethod) throws java.io.IOException {
+              return rt.getRequestFactory().createRequest(uri, httpMethod);
+            }
+          })
+          .baseUrl("http://vault:8200")
+          .defaultHeaders(h -> {
+            h.set("X-Vault-Token", "test-token");
+            h.setContentType(MediaType.APPLICATION_JSON);
+          })
+          .build();
+      ReflectionTestUtils.setField(svc, "vaultClient", testClient);
 
-    var testClient = org.springframework.web.client.RestClient.builder()
-        .baseUrl("http://smseagle.local")
-        .requestFactory(new org.springframework.http.client.ClientHttpRequestFactory() {
-          @Override public org.springframework.http.client.ClientHttpRequest createRequest(java.net.URI uri, org.springframework.http.HttpMethod httpMethod) throws java.io.IOException {
-            return rt.getRequestFactory().createRequest(uri, httpMethod);
-          }
-        })
-        .defaultHeaders(h -> {
-          h.setBasicAuth("user","pass");
-          h.setContentType(MediaType.APPLICATION_JSON);
-        })
-        .build();
+      server.expect(requestTo("http://vault:8200/v1/transit/hmac/otp-hmac"))
+          .andExpect(method(org.springframework.http.HttpMethod.POST))
+          .andExpect(header("X-Vault-Token", "test-token"))
+          .andRespond(withSuccess("{\"data\":{\"hmac\":\"vault:v1:abc\"}}", MediaType.APPLICATION_JSON));
 
-    ReflectionTestUtils.setField(sender, "client", testClient);
-
-    String basic = "Basic " + Base64.getEncoder().encodeToString("user:pass".getBytes(StandardCharsets.UTF_8));
-
-    server.expect(requestTo("http://smseagle.local/api/v2/messages/sms"))
-        .andExpect(method(org.springframework.http.HttpMethod.POST))
-        .andExpect(header("Authorization", basic))
-        .andRespond(withSuccess("{}", MediaType.APPLICATION_JSON));
-
-    sender.send("+221771234567", "Hello");
-    server.verify();
+      String h = svc.hmac("cid","+221771234567","123456");
+      assertThat(h).isEqualTo("vault:v1:abc");
+      server.verify();
+      
+    } finally {
+      // Nettoyer les proprietes systeme
+      System.clearProperty("VAULT_URI");
+      System.clearProperty("VAULT_TOKEN");
+    }
   }
 }
 EOF
 
-cat > "${SRC_TEST}/OtpServiceTest.java" <<EOF
-package ${PKG};
-import heritage.africa.otp.otp.InMemoryOtpStore;
-import heritage.africa.otp.vault.VaultTransitMacService;
+# Test LocalMacService
+cat > "${SRC_TEST}/vault/LocalMacServiceTest.java" <<EOF
+package ${PKG}.vault;
+
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.vault.core.VaultTemplate;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.Mockito.*;
 
-public class OtpServiceTest {
+class LocalMacServiceTest {
 
-  @Test
-  void create_then_verify_success() {
-    AppProps props = new AppProps(
-        new AppProps.Otp(300,5,1800),
-        new AppProps.Locale("+221"),
-        new AppProps.Vault("otp-hmac"),
-        new AppProps.Smseagle("http://x","u","p","/api/v2/messages/sms")
-    );
+    private LocalMacService localMacService;
 
-    // Fake MAC déterministe (mock VaultTransitMacService au lieu d'appeler Vault)
-    VaultTransitMacService mac = mock(VaultTransitMacService.class);
-    when(mac.hmac(anyString(), anyString(), anyString())).thenAnswer(inv ->
-        "MAC(" + inv.getArgument(0) + "," + inv.getArgument(1) + "," + inv.getArgument(2) + ")"
-    );
+    @BeforeEach
+    void setUp() {
+        localMacService = new LocalMacService();
+    }
 
-    var store = new InMemoryOtpStore();
-    var svc = new OtpService(store, mac, props);
+    @Test
+    void hmac_ShouldReturnConsistentResult() {
+        // Given
+        String challengeId = "test-challenge";
+        String destination = "+33612345678";
+        String code = "123456";
 
-    var ch = svc.create(new Destination(Channel.SMS, "+221771234567"));
-    // on “recalcule” le même MAC attendu
-    when(mac.hmac(eq(ch.challengeId()), eq("+221771234567"), eq(ch.code()))).thenReturn("MAC(" + ch.challengeId() + ",+221771234567," + ch.code() + ")");
+        // When
+        String result1 = localMacService.hmac(challengeId, destination, code);
+        String result2 = localMacService.hmac(challengeId, destination, code);
 
-    assertThat(svc.verify(ch.challengeId(), ch.code())).isTrue();
-    assertThat(svc.verify(ch.challengeId(), ch.code())).isFalse(); // one-time
-  }
+        // Then
+        assertThat(result1).isNotNull().startsWith("local:v1:");
+        assertThat(result2).isEqualTo(result1);
+    }
 
-  @Test
-  void verify_fails_and_locks_after_max_attempts() {
-    AppProps props = new AppProps(
-        new AppProps.Otp(300,2,60),
-        new AppProps.Locale("+221"),
-        new AppProps.Vault("otp-hmac"),
-        new AppProps.Smseagle("http://x","u","p","/api/v2/messages/sms")
-    );
-  
-    VaultTransitMacService mac = mock(VaultTransitMacService.class);
-    when(mac.hmac(anyString(), anyString(), anyString())).thenAnswer(inv ->
-        "MAC(" + inv.getArgument(0) + "," + inv.getArgument(1) + "," + inv.getArgument(2) + ")"
-    );
-  
-    var store = new InMemoryOtpStore();
-    var svc = new OtpService(store, mac, props);
-  
-    var ch = svc.create(new Destination(Channel.EMAIL, "user@example.com"));
-  
-    assertThat(svc.verify(ch.challengeId(), "000000")).isFalse();
-    assertThat(svc.verify(ch.challengeId(), "111111")).isFalse(); // atteint max attempts -> lock
-    assertThat(svc.verify(ch.challengeId(), ch.code())).isFalse(); // locked
-  }
+    @Test
+    void hmac_ShouldReturnDifferentResultsForDifferentInputs() {
+        // Given
+        String challengeId = "test-challenge";
+        String destination = "+33612345678";
+        String code1 = "123456";
+        String code2 = "654321";
 
+        // When
+        String result1 = localMacService.hmac(challengeId, destination, code1);
+        String result2 = localMacService.hmac(challengeId, destination, code2);
+
+        // Then
+        assertThat(result1).isNotEqualTo(result2);
+    }
 }
 EOF
 
-# -----------------------------
-# README + scripts
-# -----------------------------
-cat > "$BASE/README.md" <<EOF
-# ${NAME}
+# Test OtpService
+cat > "${SRC_TEST}/otp/OtpServiceTest.java" <<EOF
+package ${PKG}.otp;
 
-Microservice OTP d'inscription:
-- Locaux (indicatif \`+221\`) : OTP par SMS via **SMSEAGLE** (Basic Auth user/pass)
-- Étrangers : OTP par **Email** (SMTP)
-- Stockage OTP : **Redis** (TTL) ou **InMemory** (dev/test)
-- HMAC OTP : **Vault Transit** (\`transit/hmac/{key}\`) — secret HMAC ne sort pas de Vault
-- Prod OpenShift “propre” : **Vault Kubernetes Auth** (pas de token statique)
+import ${PKG}.Channel;
+import ${PKG}.OtpService;
+import ${PKG}.AppProps;
+import ${PKG}.vault.LocalMacService;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.junit.jupiter.MockitoExtension;
 
-## Profils
-- dev : Vault OFF, store memory
-- test : Vault OFF, store memory
-- docker : store redis, Vault TOKEN optionnel via VAULT_ENABLED/VAULT_TOKEN
-- kubernetes : Vault ON (KUBERNETES auth), store redis
-- qualif/preprod/prod : incluent kubernetes
+import static org.assertj.core.api.Assertions.assertThat;
 
-## API
-- POST \`/auth/register/start\`
-- POST \`/auth/register/verify\`
-- Health: \`/actuator/health/liveness\` et \`/actuator/health/readiness\`
+@ExtendWith(MockitoExtension.class)
+class OtpServiceTest {
 
-## Build & Test
-\`\`\`bash
-mvn test
-mvn package
-\`\`\`
+    private OtpService otpService;
+    private InMemoryOtpStore otpStore;
 
-## Local (dev)
-\`\`\`bash
-SPRING_PROFILES_ACTIVE=dev mvn spring-boot:run
-\`\`\`
+    @BeforeEach
+    void setUp() {
+        AppProps.Otp otpProps = new AppProps.Otp(300, 6, 3, 30);
+        AppProps.Locale localeProps = new AppProps.Locale("+221");
+        AppProps.Vault vaultProps = new AppProps.Vault("otp-hmac");
+        AppProps.Smseagle smseagleProps = new AppProps.Smseagle("http://localhost", "user", "pass");
+        AppProps props = new AppProps(otpProps, localeProps, vaultProps, smseagleProps);
+        
+        otpStore = new InMemoryOtpStore();
+        otpService = new OtpService(otpStore, new LocalMacService(), props);
+    }
 
-## Docker (profil docker)
-\`\`\`bash
-docker build -f docker/Dockerfile -t ${IMAGE} .
-docker run --rm -p 8080:8080 \\
-  -e SPRING_PROFILES_ACTIVE=docker \\
-  -e OTP_STORE=redis \\
-  -e REDIS_HOST=redis \\
-  ${IMAGE}
-\`\`\`
+    @Test
+    void createAndVerifyChallenge() {
+        String destination = "+33612345678";
+        Channel channel = Channel.SMS;
 
-## OpenShift (kustomize)
-\`\`\`bash
-oc new-project ${K8S_NS} || true
-oc apply -k manifests/openshift
-\`\`\`
+        var challenge = otpService.createChallenge(destination, channel);
 
-### Vault côté OpenShift (rappel)
-Le rôle Vault Kubernetes doit binder:
-- ServiceAccount: \`${NAME}-sa\`
-- Namespace: \`${K8S_NS}\`
+        assertThat(challenge.challengeId()).isNotNull();
+        assertThat(challenge.code()).hasSize(6);
+
+        boolean verified = otpService.verifyChallenge(challenge.challengeId(), challenge.code());
+        assertThat(verified).isTrue();
+
+        boolean verifiedAgain = otpService.verifyChallenge(challenge.challengeId(), challenge.code());
+        assertThat(verifiedAgain).isFalse();
+    }
+
+    @Test
+    void maxAttemptsShouldLock() {
+        String destination = "test@example.com";
+        Channel channel = Channel.EMAIL;
+        var challenge = otpService.createChallenge(destination, channel);
+
+        for (int i = 0; i < 3; i++) {
+            boolean verified = otpService.verifyChallenge(challenge.challengeId(), "000000");
+            assertThat(verified).isFalse();
+        }
+
+        boolean verified = otpService.verifyChallenge(challenge.challengeId(), challenge.code());
+        assertThat(verified).isFalse();
+    }
+}
 EOF
 
-cat > "$BASE/scripts/dev-redis-vault.sh" <<'EOF'
-#!/usr/bin/env bash
+# Test OtpOrchestrator
+cat > "${SRC_TEST}/OtpOrchestratorTest.java" <<EOF
+package ${PKG};
+
+import ${PKG}.dto.OtpRequest;
+import ${PKG}.dto.OtpResponse;
+import ${PKG}.notify.EmailSender;
+import ${PKG}.notify.SmsSender;
+import ${PKG}.otp.InMemoryOtpStore;
+import ${PKG}.otp.OtpStore;
+import ${PKG}.vault.LocalMacService;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class OtpOrchestratorTest {
+
+    @Mock
+    private SmsSender smsSender;
+    
+    @Mock
+    private EmailSender emailSender;
+
+    private OtpOrchestrator orchestrator;
+
+    @BeforeEach
+    void setUp() {
+        AppProps.Otp otpProps = new AppProps.Otp(300, 6, 3, 30);
+        AppProps.Locale localeProps = new AppProps.Locale("+221");
+        AppProps.Vault vaultProps = new AppProps.Vault("otp-hmac");
+        AppProps.Smseagle smseagleProps = new AppProps.Smseagle("http://localhost", "user", "pass");
+        AppProps props = new AppProps(otpProps, localeProps, vaultProps, smseagleProps);
+        
+        OtpStore otpStore = new InMemoryOtpStore();
+        OtpService otpService = new OtpService(otpStore, new LocalMacService(), props);
+        
+        orchestrator = new OtpOrchestrator(otpService, smsSender, emailSender, props);
+    }
+
+    @Test
+    void startChallengeWithLocalPhoneShouldUseSms() {
+        OtpRequest request = new OtpRequest("+221771234567", null);
+
+        OtpResponse response = orchestrator.startChallenge(request);
+
+        assertThat(response.channel()).isEqualTo(Channel.SMS);
+        assertThat(response.maskedDestination()).contains("****");
+        verify(smsSender, times(1)).send(anyString(), anyString());
+        verify(emailSender, never()).send(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void startChallengeWithInternationalPhoneAndEmailShouldUseEmail() {
+        OtpRequest request = new OtpRequest("+1234567890", "test@example.com");
+
+        OtpResponse response = orchestrator.startChallenge(request);
+
+        assertThat(response.channel()).isEqualTo(Channel.EMAIL);
+        assertThat(response.maskedDestination()).contains("***");
+        verify(emailSender, times(1)).send(anyString(), anyString(), anyString());
+        verify(smsSender, never()).send(anyString(), anyString());
+    }
+}
+EOF
+
+# ============================================
+# 5. Docker Compose et scripts
+# ============================================
+log_info "Génération des fichiers Docker et scripts..."
+
+# Dockerfile
+cat > "$BASE/docker/Dockerfile" <<'EOF'
+# syntax=docker/dockerfile:1
+ARG JAVA_VERSION=21
+
+# Build stage
+FROM maven:3.9-eclipse-temurin-${JAVA_VERSION} AS build
+WORKDIR /build
+
+# Copie des fichiers Maven
+COPY pom.xml .
+RUN mvn dependency:go-offline -B
+
+# Copie et compilation du code source
+COPY src ./src
+RUN mvn clean package -DskipTests
+
+# Runtime stage
+FROM eclipse-temurin:${JAVA_VERSION}-jre-alpine
+
+# Installation des outils de monitoring
+RUN apk add --no-cache curl
+
+# Création d'un utilisateur non-root
+RUN addgroup -S spring && adduser -S spring -G spring
+
+WORKDIR /app
+
+# Copie du JAR depuis l'étape de build
+COPY --from=build /build/target/*.jar app.jar
+
+# Configuration des permissions
+RUN chown -R spring:spring /app
+
+USER spring:spring
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:8080/actuator/health || exit 1
+
+EXPOSE 8080
+
+ENV JAVA_OPTS="-Xms256m -Xmx512m -XX:+UseG1GC"
+
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app/app.jar"]
+EOF
+
+# Script d'initialisation Vault
+cat > "$BASE/docker/vault/init-vault.sh" <<'EOF'
+#!/bin/sh
 set -e
-# Helper local : redis + vault (dev token) pour tests manuels
-docker network create otp-net >/dev/null 2>&1 || true
 
-docker run -d --name otp-redis --network otp-net -p 6379:6379 redis:7-alpine >/dev/null 2>&1 || true
+echo "⏳ Attente que Vault soit prêt..."
+sleep 5
 
-docker run -d --name otp-vault --network otp-net -p 8200:8200 \
-  -e 'VAULT_DEV_ROOT_TOKEN_ID=devtoken' \
-  -e 'VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200' \
-  hashicorp/vault:1.16 >/dev/null 2>&1 || true
+echo "🔧 Configuration de Vault..."
 
-echo "Vault token: devtoken"
-echo "Enable transit & create key:"
-echo "  export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=devtoken"
-echo "  vault secrets enable transit"
-echo "  vault write -f transit/keys/otp-hmac"
+# Activer le moteur Transit
+vault secrets enable transit || echo "Transit déjà activé"
+
+# Créer la clé HMAC pour OTP
+vault write -f transit/keys/otp-hmac || echo "Clé otp-hmac existe déjà"
+
+echo "✅ Vault configuré avec succès !"
+
+# Tester la configuration
+echo "🧪 Test de la clé HMAC..."
+vault write transit/hmac/otp-hmac input=$(echo -n "test" | base64)
+
+echo "🎉 Initialisation terminée !"
 EOF
-chmod +x "$BASE/scripts/dev-redis-vault.sh"
+chmod +x "$BASE/docker/vault/init-vault.sh"
 
-# -----------------------------
-# Git ignore
-# -----------------------------
-cat > "$BASE/.gitignore" <<'EOF'
-/target
-/.idea
-/*.iml
-/.vscode
-*.log
+# Docker Compose
+cat > "$BASE/docker-compose.yml" <<'EOF'
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: otp-auth-service
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - VAULT_TOKEN=dev-token
+      - VAULT_URI=http://vault:8200
+      - LOCAL_COUNTRY_CODE=+221
+      - SMSEAGLE_URL=http://smseagle-mock:8080
+      - SMSEAGLE_USERNAME=admin
+      - SMSEAGLE_PASSWORD=admin
+      - JAVA_OPTS=-Xms256m -Xmx512m
+    depends_on:
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      vault-setup:
+        condition: service_completed_successfully
+      mailhog:
+        condition: service_started
+      smseagle-mock:
+        condition: service_started
+    networks:
+      - otp-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    container_name: otp-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - otp-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: otp-vault
+    cap_add:
+      - IPC_LOCK
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=dev-token
+      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    networks:
+      - otp-network
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    command: server -dev -dev-root-token-id=dev-token
+
+  vault-setup:
+    image: hashicorp/vault:1.15
+    container_name: otp-vault-setup
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=dev-token
+    networks:
+      - otp-network
+    volumes:
+      - ./docker/vault/init-vault.sh:/init-vault.sh
+    entrypoint: ["/bin/sh", "/init-vault.sh"]
+
+  mailhog:
+    image: mailhog/mailhog
+    container_name: otp-mailhog
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+    networks:
+      - otp-network
+
+  smseagle-mock:
+    image: alpine/socat
+    container_name: otp-smseagle-mock
+    command: TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'echo "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"sent\"}"'
+    ports:
+      - "8081:8080"
+    networks:
+      - otp-network
+
+networks:
+  otp-network:
+    driver: bridge
+
+volumes:
+  redis-data:
 EOF
 
-log "✅ Projet généré: $BASE"
-log "Prochaines commandes:"
-echo "  cd \"$BASE\""
-echo "  mvn test"
-echo "  docker build -f docker/Dockerfile -t ${IMAGE} ."
-echo "  oc new-project ${K8S_NS} || true"
-echo "  oc apply -k manifests/openshift"
+# Scripts utilitaires
+cat > "$BASE/scripts/start-dev.sh" <<'EOF'
+#!/bin/bash
+set -e
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+echo -e "${BLUE}🚀 Démarrage de l'environnement de développement OTP${NC}"
+
+# Nettoyage des anciens conteneurs
+echo -e "${YELLOW}🧹 Nettoyage des anciens conteneurs...${NC}"
+docker-compose down -v --remove-orphans 2>/dev/null || true
+
+# Compilation du projet
+echo -e "${YELLOW}📦 Compilation du projet...${NC}"
+mvn clean package -DskipTests
+
+# Démarrage des services
+echo -e "${YELLOW}🐳 Démarrage des services Docker...${NC}"
+docker-compose up -d --build
+
+# Attente que tout soit prêt
+echo -e "${YELLOW}⏳ Attente du démarrage des services...${NC}"
+sleep 10
+
+# Affichage des logs
+echo -e "${GREEN}✅ Services démarrés !${NC}"
+echo -e "${BLUE}📝 Logs de l'application:${NC}"
+docker-compose logs -f app
+EOF
+chmod +x "$BASE/scripts/start-dev.sh"
+
+cat > "$BASE/scripts/test-api.sh" <<'EOF'
+#!/bin/bash
+set -e
+
+BASE_URL="http://localhost:8080"
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+echo "🧪 Test de l'API OTP"
+
+# 1. Demander un OTP pour un numéro local
+echo -e "\n📱 Test SMS local (+221):"
+RESPONSE=$(curl -s -X POST $BASE_URL/auth/register/start \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"+221771234567","email":""}')
+echo "$RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE"
+
+# Extraire challengeId
+CHALLENGE_ID=$(echo "$RESPONSE" | grep -o '"challengeId":"[^"]*' | cut -d'"' -f4)
+
+if [ -n "$CHALLENGE_ID" ]; then
+  echo -e "\n🔑 Test de vérification (mauvais code):"
+  curl -s -X POST $BASE_URL/auth/register/verify \
+    -H "Content-Type: application/json" \
+    -d "{\"challengeId\":\"$CHALLENGE_ID\",\"code\":\"000000\"}" | python3 -m json.tool 2>/dev/null || echo "Pas de JSON"
+fi
+
+# 2. Test email pour international
+echo -e "\n📧 Test Email (international):"
+curl -s -X POST $BASE_URL/auth/register/start \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"+1234567890","email":"test@example.com"}' | python3 -m json.tool 2>/dev/null || echo "Pas de JSON"
+
+echo -e "\n📊 Health check:"
+curl -s $BASE_URL/actuator/health | python3 -m json.tool 2>/dev/null || echo "Pas de JSON"
+EOF
+chmod +x "$BASE/scripts/test-api.sh"
+
+cat > "$BASE/scripts/check-vault.sh" <<'EOF'
+#!/bin/bash
+set -e
+
+VAULT_ADDR="http://localhost:8200"
+VAULT_TOKEN="dev-token"
+
+echo "🔍 Vérification de Vault..."
+
+# Test de connexion
+if curl -s -H "X-Vault-Token: $VAULT_TOKEN" $VAULT_ADDR/v1/sys/health | grep -q "initialized"; then
+    echo "✅ Vault est opérationnel"
+else
+    echo "❌ Vault n'est pas accessible"
+    exit 1
+fi
+
+# Test de la clé HMAC
+echo "🧪 Test de la clé HMAC..."
+RESULT=$(curl -s -H "X-Vault-Token: $VAULT_TOKEN" \
+    -X POST -d '{"input":"'$(echo -n "test" | base64)'"}' \
+    $VAULT_ADDR/v1/transit/hmac/otp-hmac)
+
+if echo "$RESULT" | grep -q "hmac"; then
+    echo "✅ Clé HMAC fonctionnelle"
+else
+    echo "❌ Problème avec la clé HMAC"
+    exit 1
+fi
+
+echo "🎉 Vault est prêt !"
+EOF
+chmod +x "$BASE/scripts/check-vault.sh"
+
+# README
+cat > "$BASE/README.md" <<'EOF'
+# OTP Auth Service
+
+Service d'authentification par OTP avec Vault et SMSEAGLE.
+
+## Architecture
+
+- **Backend**: Spring Boot 3.2.5
+- **Stockage OTP**: Redis
+- **HMAC**: Vault Transit (via API REST)
+- **Notifications**: SMSEAGLE (SMS) / SMTP (Email)
+
+## Prérequis
+
+- Java 21
+- Docker & Docker Compose
+- Maven
+
+## Démarrage rapide
+
+```bash
+# Démarrer tous les services
+./scripts/start-dev.sh
+
+# Tester l'API
+./scripts/test-api.sh
+
+# Vérifier Vault
+./scripts/check-vault.sh
+EOF
