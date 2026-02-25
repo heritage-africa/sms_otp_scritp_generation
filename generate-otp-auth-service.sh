@@ -1359,8 +1359,6 @@ chmod +x "$BASE/docker/vault/init-vault.sh"
 
 # Docker Compose
 cat > "$BASE/docker-compose.yml" <<'EOF'
-version: '3.8'
-
 services:
   app:
     build:
@@ -1374,25 +1372,26 @@ services:
       - VAULT_TOKEN=dev-token
       - VAULT_URI=http://vault:8200
       - LOCAL_COUNTRY_CODE=+221
-      - SMSEAGLE_URL=http://smseagle-mock:8080
+      - SMSEAGLE_URL=http://smseagle:8080
       - SMSEAGLE_USERNAME=admin
       - SMSEAGLE_PASSWORD=admin
+      - SMSEAGLE_SMS_PATH=/send
       - JAVA_OPTS=-Xms256m -Xmx512m
     depends_on:
       redis:
         condition: service_healthy
       vault:
-        condition: service_healthy
+        condition: service_started
       vault-setup:
         condition: service_completed_successfully
       mailhog:
         condition: service_started
-      smseagle-mock:
+      smseagle:
         condition: service_started
     networks:
       - otp-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -1425,25 +1424,20 @@ services:
       - "8200:8200"
     networks:
       - otp-network
-    healthcheck:
-      test: ["CMD", "vault", "status"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-    command: server -dev -dev-root-token-id=dev-token
+    
 
   vault-setup:
     image: hashicorp/vault:1.15
     container_name: otp-vault-setup
     depends_on:
       vault:
-        condition: service_healthy
+        condition: service_started
     environment:
       - VAULT_ADDR=http://vault:8200
       - VAULT_TOKEN=dev-token
     networks:
       - otp-network
+    
     volumes:
       - ./docker/vault/init-vault.sh:/init-vault.sh
     entrypoint: ["/bin/sh", "/init-vault.sh"]
@@ -1456,15 +1450,20 @@ services:
       - "1025:1025"
     networks:
       - otp-network
+      
 
-  smseagle-mock:
-    image: alpine/socat
+  smseagle:
+    image: hashicorp/http-echo:1.0.0
     container_name: otp-smseagle-mock
-    command: TCP-LISTEN:8080,fork,reuseaddr SYSTEM:'echo "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"sent\"}"'
+    command:
+      - "-listen=:8080"
+      - "-status-code=200"
+      - "-text={\"status\":\"sent\"}"
     ports:
       - "8081:8080"
     networks:
       - otp-network
+
 
 networks:
   otp-network:
