@@ -1473,6 +1473,269 @@ volumes:
   redis-data:
 EOF
 
+# 1. Créer les manifests de base
+cat > "$BASE/k8s/base/namespace.yaml" <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otp-system
+EOF
+
+cat > "$BASE/k8s/base/configmap.yaml" <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otp-config
+  namespace: otp-system
+data:
+  LOCAL_COUNTRY_CODE: "+221"
+  OTP_TTL: "300"
+  OTP_LENGTH: "6"
+  OTP_MAX_ATTEMPTS: "3"
+  OTP_LOCK_MINUTES: "30"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  SMSEAGLE_URL: "http://smseagle:8080"
+  SMSEAGLE_USERNAME: "admin"
+  SMSEAGLE_SMS_PATH: "/send"
+  VAULT_URI: "http://vault:8200"
+  SPRING_PROFILES_ACTIVE: "kubernetes"
+  JAVA_OPTS: "-Xms256m -Xmx512m"
+EOF
+
+cat > "$BASE/k8s/base/secret.yaml" <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: otp-secrets
+  namespace: otp-system
+type: Opaque
+stringData:
+  SMSEAGLE_PASSWORD: "admin"
+  VAULT_TOKEN: "dev-token"
+EOF
+
+cat > "$BASE/k8s/base/deployment.yaml" <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otp-auth-service
+  namespace: otp-system
+  labels:
+    app: otp-auth-service
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: otp-auth-service
+  template:
+    metadata:
+      labels:
+        app: otp-auth-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      containers:
+      - name: app
+        image: otp-auth-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: VAULT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: otp-secrets
+              key: VAULT_TOKEN
+        envFrom:
+        - configMapRef:
+            name: otp-config
+        - secretRef:
+            name: otp-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 5
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+EOF
+
+cat > "$BASE/k8s/base/service.yaml" <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: otp-auth-service
+  namespace: otp-system
+  labels:
+    app: otp-auth-service
+spec:
+  selector:
+    app: otp-auth-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  type: ClusterIP
+EOF
+
+cat > "$BASE/k8s/base/serviceaccount.yaml" <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otp-sa
+  namespace: otp-system
+EOF
+
+cat > "$BASE/k8s/base/kustomization.yaml" <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: otp-system
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - deployment.yaml
+  - service.yaml
+  - serviceaccount.yaml
+commonLabels:
+  app: otp-auth-service
+  managed-by: kustomize
+EOF
+
+# 2. Overlay pour développement
+cat > "$BASE/k8s/overlays/dev/kustomization.yaml" <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+namespace: otp-dev
+patches:
+  - target:
+      kind: Deployment
+      name: otp-auth-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: otp-auth-service:dev
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always
+EOF
+
+cat > "$BASE/k8s/overlays/dev/route.yaml" <<'EOF'
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: otp-auth-service
+  namespace: otp-dev
+spec:
+  to:
+    kind: Service
+    name: otp-auth-service
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+EOF
+
+# 3. Overlay pour production
+cat > "$BASE/k8s/overlays/prod/kustomization.yaml" <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+namespace: otp-prod
+patches:
+  - target:
+      kind: Deployment
+      name: otp-auth-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: "512Mi"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: "200m"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: "1Gi"
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/cpu
+        value: "1000m"
+EOF
+
+cat > "$BASE/k8s/overlays/prod/hpa.yaml" <<'EOF'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: otp-auth-service
+  namespace: otp-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: otp-auth-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+EOF
+
+cat > "$BASE/k8s/overlays/prod/pdb.yaml" <<'EOF'
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: otp-auth-service
+  namespace: otp-prod
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: otp-auth-service
+EOF
+
+
 # Scripts utilitaires
 cat > "$BASE/scripts/start-dev.sh" <<'EOF'
 #!/bin/bash
@@ -1581,6 +1844,97 @@ echo "🎉 Vault est prêt !"
 EOF
 chmod +x "$BASE/scripts/check-vault.sh"
 
+# 4. Script de déploiement
+cat > "$BASE/scripts/deploy-k8s.sh" <<'EOF'
+#!/bin/bash
+set -e
+
+ENV=${1:-dev}
+NAMESPACE="otp-${ENV}"
+
+echo "🚀 Déploiement sur Kubernetes/OpenShift (environnement: $ENV)..."
+
+# Vérifier si on est sur OpenShift
+if command -v oc &> /dev/null; then
+    echo "📌 OpenShift détecté"
+    CMD="oc"
+else
+    echo "📌 Kubernetes détecté"
+    CMD="kubectl"
+fi
+
+# Appliquer les manifests
+echo "📦 Application des manifests..."
+$CMD apply -k ${BASE}/k8s/overlays/${ENV}
+
+# Attendre le déploiement
+echo "⏳ Attente du déploiement..."
+$CMD rollout status deployment/otp-auth-service -n ${NAMESPACE} --timeout=300s
+
+# Afficher les endpoints
+if [ "$ENV" = "dev" ] && [ "$CMD" = "oc" ]; then
+    ROUTE=$($CMD get route otp-auth-service -n ${NAMESPACE} -o jsonpath='{.spec.host}')
+    echo "🌐 Route: https://${ROUTE}"
+fi
+
+echo "✅ Déploiement terminé !"
+EOF
+
+chmod +x "$BASE/scripts/deploy-k8s.sh"
+
+# 5. Script de test après déploiement
+cat > "$BASE/scripts/test-k8s.sh" <<'EOF'
+#!/bin/bash
+set -e
+
+ENV=${1:-dev}
+NAMESPACE="otp-${ENV}"
+
+echo "🧪 Test du service déployé sur $ENV..."
+
+# Récupérer l'URL
+if command -v oc &> /dev/null; then
+    URL="https://$(oc get route otp-auth-service -n ${NAMESPACE} -o jsonpath='{.spec.host}')"
+else
+    # Pour Kubernetes, utiliser le port-forward
+    echo "📌 Utilisation du port-forward..."
+    kubectl port-forward -n ${NAMESPACE} svc/otp-auth-service 8080:8080 &
+    PF_PID=$!
+    sleep 3
+    URL="http://localhost:8080"
+fi
+
+# Tester l'API
+echo "📱 Test de l'API..."
+
+# 1. Health check
+echo -n "Health check: "
+curl -s ${URL}/actuator/health | jq .status
+
+# 2. Demander un OTP
+echo "Demande d'OTP:"
+RESPONSE=$(curl -s -X POST ${URL}/auth/register/start \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"+221771234567"}')
+echo $RESPONSE | jq .
+
+CHALLENGE_ID=$(echo $RESPONSE | jq -r .challengeId)
+
+# 3. Vérifier l'OTP (code factice pour test)
+echo "Vérification d'OTP:"
+curl -s -X POST ${URL}/auth/register/verify \
+  -H "Content-Type: application/json" \
+  -d "{\"challengeId\":\"$CHALLENGE_ID\",\"code\":\"123456\"}" | jq .
+
+# Nettoyer le port-forward si nécessaire
+if [ -n "${PF_PID:-}" ]; then
+    kill $PF_PID 2>/dev/null || true
+fi
+
+echo "✅ Test terminé !"
+EOF
+chmod +x "$BASE/scripts/test-k8s.sh"
+
 # README
 cat > "$BASE/README.md" <<'EOF'
 # OTP Auth Service
@@ -1611,4 +1965,21 @@ Service d'authentification par OTP avec Vault et SMSEAGLE.
 
 # Vérifier Vault
 ./scripts/check-vault.sh
+
+## Déploiement Kubernetes/OpenShift
+
+### Prérequis
+- kubectl ou oc (OpenShift CLI)
+- Accès à un cluster Kubernetes/OpenShift
+
+### Déploiement
+
+```bash
+# Déploiement en développement
+./scripts/deploy-k8s.sh dev
+
+# Déploiement en production
+./scripts/deploy-k8s.sh prod
+```
+
 EOF
